@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V4
+# Script de Importação Automática ESXi -> Proxmox V5
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,11 +15,10 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V4 (Auto-Config)."
+log_msg "Iniciando sistema de importação V5 (Boot Seguro & MAC Preserve)."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
-# Verifica se consegue criar ISOs
 if ! command -v genisoimage &> /dev/null; then
     log_msg "[*] Instalando 'genisoimage' para criação do CD virtual..."
     apt-get update >/dev/null && apt-get install genisoimage -y >/dev/null
@@ -69,7 +68,6 @@ read -p "Aplicar ajustes de Hardware (Agent, Boot, VirtIO, Sockets)? [1] Sim / [
 read -p "Disponibilizar script pós-instalação via CD-ROM virtual? [1] Sim / [2] Não: " OPT_INJECT
 read -p "Ligar as VMs automaticamente após a importação? [1] Sim / [2] Não: " OPT_START
 
-# Criação do ISO com o seu script
 if [ "$OPT_INJECT" == "1" ]; then
     log_msg "Gerando ISO com script de pós-instalação..."
     TMP_DIR=$(mktemp -d)
@@ -161,7 +159,6 @@ else
     for num in $ESCOLHA_USER; do VMS_PARA_IMPORTAR+=("$num"); done
 fi
 
-# Coleta de VLANs antes de iniciar
 declare -A MAPA_VLANS
 if [ "$OPT_VLAN" == "1" ]; then
     echo -e "\n=== CONFIGURAÇÃO DE VLAN ==="
@@ -192,10 +189,9 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
     if [ $EXIT_CODE -eq 0 ]; then
         log_msg "[v] VM $CURRENT_VMID importada. Aplicando automações..."
         
-        # Ajustes de Hardware
         if [ "$OPT_HW" == "1" ]; then
-            # Descobre qual é o disco de boot (scsi0, sata0, etc) para não quebrar o boot order
-            DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata)[0-9]+:' | head -n 1 | awk -F: '{print $1}')
+            # FILTRO CORRIGIDO: Ignora qualquer cdrom e pega o primeiro disco real
+            DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata|virtio)[0-9]+:' | grep -v 'cdrom' | head -n 1 | awk -F: '{print $1}')
             
             qm set $CURRENT_VMID --agent 1
             qm set $CURRENT_VMID --onboot 1
@@ -203,24 +199,31 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
             qm set $CURRENT_VMID --vga virtio
             qm set $CURRENT_VMID --scsihw virtio-scsi-single
             
+            # Aplica o boot no disco real garantindo que cdrom fique de fora da ordem
             if [ -n "$DISCO_BOOT" ]; then
                 qm set $CURRENT_VMID --boot order=$DISCO_BOOT
             fi
             
-            NET_CONFIG="virtio,bridge=vmbr0"
+            # PRESERVAÇÃO DO MAC ADDRESS ORIGINAL
+            MAC_ATUAL=$(qm config $CURRENT_VMID | grep '^net0:' | grep -o -i -E '([0-9a-f]{2}:){5}[0-9a-f]{2}')
+            
+            if [ -n "$MAC_ATUAL" ]; then
+                NET_CONFIG="virtio=${MAC_ATUAL},bridge=vmbr0"
+            else
+                NET_CONFIG="virtio,bridge=vmbr0"
+            fi
+            
             if [ -n "${MAPA_VLANS[$num_vm]}" ]; then
                 NET_CONFIG="$NET_CONFIG,tag=${MAPA_VLANS[$num_vm]}"
             fi
+            
             qm set $CURRENT_VMID --net0 "$NET_CONFIG"
         fi
         
-        # Injeção do ISO
         if [ "$OPT_INJECT" == "1" ]; then
-            # Utiliza ide2 (padrão de cdrom no proxmox) e vincula o ISO gerado
             qm set $CURRENT_VMID --ide2 local:iso/pos_install_esxi.iso,media=cdrom
         fi
         
-        # Start Automático
         if [ "$OPT_START" == "1" ]; then
             log_msg "[*] Ligando a VM $CURRENT_VMID..."
             qm start $CURRENT_VMID
