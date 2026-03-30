@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V6 (Mutação Cirúrgica)
+# Script de Importação Automática ESXi -> Proxmox V7 (Multi-NIC Dinâmico)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,7 +15,7 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V6 (Mutação Conservadora)."
+log_msg "Iniciando sistema de importação V7 (Multi-NIC & Limpeza de CD)."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
@@ -26,9 +26,7 @@ fi
 
 cleanup() {
     log_msg "\n[!] AVISO: INTERRUPÇÃO DETECTADA (Ctrl+C)!"
-    if [ -n "$IMPORT_PID" ]; then
-        kill -9 $IMPORT_PID 2>/dev/null
-    fi
+    if [ -n "$IMPORT_PID" ]; then kill -9 $IMPORT_PID 2>/dev/null; fi
     if [ -n "$CURRENT_VMID" ]; then
         log_msg "[*] Removendo VM incompleta ($CURRENT_VMID)..."
         qm destroy $CURRENT_VMID --purge 1 >> "$LOG_FILE" 2>&1
@@ -47,23 +45,16 @@ processar_saida() {
             last_trans="$line"
             prev_was_trans=1
         else
-            if [[ $prev_was_trans -eq 1 ]]; then
-                echo "" 
-                echo "$ts $last_trans" >> "$LOG_FILE"
-                prev_was_trans=0
-            fi
+            if [[ $prev_was_trans -eq 1 ]]; then echo ""; echo "$ts $last_trans" >> "$LOG_FILE"; prev_was_trans=0; fi
             echo "$ts $line" | tee -a "$LOG_FILE"
         fi
     done
-    if [[ $prev_was_trans -eq 1 ]]; then
-        echo ""
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] $last_trans" >> "$LOG_FILE"
-    fi
+    if [[ $prev_was_trans -eq 1 ]]; then echo ""; echo "[$(date +'%Y-%m-%d %H:%M:%S')] $last_trans" >> "$LOG_FILE"; fi
 }
 
 # ================= SELETORES DE AUTOMAÇÃO =================
 echo -e "\n=== OPÇÕES DE PÓS-IMPORTAÇÃO ==="
-read -p "Deseja informar VLANs para cada VM? [1] Sim / [2] Não: " OPT_VLAN
+read -p "Deseja informar VLANs para as VMs? [1] Sim / [2] Não: " OPT_VLAN
 read -p "Aplicar mutação cirúrgica de Hardware (Mantendo originais)? [1] Sim / [2] Não: " OPT_HW
 read -p "Disponibilizar script pós-instalação via CD-ROM virtual? [1] Sim / [2] Não: " OPT_INJECT
 read -p "Ligar as VMs automaticamente após a importação? [1] Sim / [2] Não: " OPT_START
@@ -75,29 +66,19 @@ if [ "$OPT_INJECT" == "1" ]; then
 #!/bin/bash
 LOG="/root/migracao_completa.log"
 log() { echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG"; }
-
 log "=== Iniciando validacao de rede e agentes ==="
 NEW_IF=$(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo\|altname' | head -n 1)
 OLD_IF=$(awk '/^iface/ && $2 != "lo" {print $2; exit}' /etc/network/interfaces)
-
-log "Hardware detectado: $NEW_IF"
-log "Configuracao atual: $OLD_IF"
-
-if [ -z "$NEW_IF" ] || [ -z "$OLD_IF" ]; then
-    log "ERRO: Interfaces nao detectadas. Abortando."
-    exit 1
-fi
-
+log "Hardware detectado: $NEW_IF | Config atual: $OLD_IF"
+if [ -z "$NEW_IF" ] || [ -z "$OLD_IF" ]; then log "ERRO: Interfaces nao detectadas. Abortando."; exit 1; fi
 if [ "$NEW_IF" != "$OLD_IF" ]; then
-    log "Inconsistencia detectada. Atualizando $OLD_IF -> $NEW_IF..."
+    log "Atualizando $OLD_IF -> $NEW_IF..."
     sed -i "s/$OLD_IF/$NEW_IF/g" /etc/network/interfaces
-    log "Reiniciando serviço de rede..."
     systemctl restart networking
     sleep 5
 else
     log "Nomes corretos. Nenhuma alteracao necessaria."
 fi
-
 log "Testando conectividade..."
 if ping -c 3 google.com &> /dev/null; then
     log "SUCESSO: Conectividade confirmada!"
@@ -108,8 +89,7 @@ if ping -c 3 google.com &> /dev/null; then
     apt-get autoremove -y &>> "$LOG"
     log "=== Concluido com sucesso! ==="
 else
-    log "FALHA: Sem internet. Abortando para evitar quebra."
-    exit 1
+    log "FALHA: Sem internet. Abortando para evitar quebra."; exit 1
 fi
 EOF
     chmod +x "$TMP_DIR/pos_import_esxi.sh"
@@ -162,10 +142,12 @@ fi
 declare -A MAPA_VLANS
 if [ "$OPT_VLAN" == "1" ]; then
     echo -e "\n=== CONFIGURAÇÃO DE VLAN ==="
+    echo "DICA: Se a VM tiver mais de 1 placa, digite as VLANs na ordem separadas por espaço (ex: 321 305)."
+    echo "DICA: Pressione Enter para deixar sem VLAN."
     for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
         nome_limpo=$(echo "${MAPA_VMS[$num_vm]}" | awk -F'/' '{print $2 " / " $NF}')
-        read -p "VLAN para [$nome_limpo] (Enter para sem vlan): " vlan_id
-        MAPA_VLANS[$num_vm]=$vlan_id
+        read -p "VLAN(s) para [$nome_limpo]: " vlan_input
+        MAPA_VLANS[$num_vm]=$vlan_input
     done
 fi
 
@@ -187,54 +169,61 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
     EXIT_CODE=$?
     
     if [ $EXIT_CODE -eq 0 ]; then
-        log_msg "[v] VM $CURRENT_VMID importada. Lendo originais e aplicando mutações..."
+        log_msg "[v] VM $CURRENT_VMID importada. Aplicando mutações..."
         
         if [ "$OPT_HW" == "1" ]; then
-            # 1. PROCESSADOR: Lê sockets e cores do VMware e converte para 1 Socket com N Cores
             OLD_CORES=$(qm config $CURRENT_VMID | awk '/^cores:/ {print $2}')
             OLD_SOCKETS=$(qm config $CURRENT_VMID | awk '/^sockets:/ {print $2}')
             [ -z "$OLD_CORES" ] && OLD_CORES=1
             [ -z "$OLD_SOCKETS" ] && OLD_SOCKETS=1
             TOTAL_CORES=$((OLD_CORES * OLD_SOCKETS))
             
-            # 2. REDE: Pesca MAC, Bridge e Firewall originais da placa net0
-            OLD_NET=$(qm config $CURRENT_VMID | grep '^net0:' | sed 's/^net0: //')
-            MAC=$(echo "$OLD_NET" | grep -o -i -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
-            BRIDGE=$(echo "$OLD_NET" | grep -o 'bridge=[^,]*')
-            FIREWALL=$(echo "$OLD_NET" | grep -o 'firewall=[0-9]')
-            
-            # Reconstrói a string de rede com VirtIO e adiciona os itens pescados
-            NEW_NET="virtio"
-            [ -n "$MAC" ] && NEW_NET="${NEW_NET}=${MAC}"
-            [ -n "$BRIDGE" ] && NEW_NET="${NEW_NET},${BRIDGE}" || NEW_NET="${NEW_NET},bridge=vmbr0"
-            [ -n "$FIREWALL" ] && NEW_NET="${NEW_NET},${FIREWALL}"
-            
-            # Adiciona a VLAN se foi informada
-            if [ -n "${MAPA_VLANS[$num_vm]}" ]; then
-                NEW_NET="${NEW_NET},tag=${MAPA_VLANS[$num_vm]}"
-            fi
-            
-            # 3. BOOT: Pega o disco principal e ignora qualquer CD-ROM que tenha vindo
             DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata|virtio)[0-9]+:' | grep -v 'cdrom' | head -n 1 | awk -F: '{print $1}')
             
-            # 4. APLICAÇÃO GERAL EM UM ÚNICO COMANDO (Para evitar concorrência no arquivo .conf)
-            qm set $CURRENT_VMID \
-                --sockets 1 \
-                --cores $TOTAL_CORES \
-                --vga virtio \
-                --scsihw virtio-scsi-single \
-                --agent 1 \
-                --onboot 1 \
-                --net0 "$NEW_NET"
+            # Seta o hardware base
+            qm set $CURRENT_VMID --sockets 1 --cores $TOTAL_CORES --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
             
-            # Seta a ordem de boot limpa no disco principal
             if [ -n "$DISCO_BOOT" ]; then
                 qm set $CURRENT_VMID --boot "order=$DISCO_BOOT"
             fi
+            
+            # MOTOR MULTI-NIC: Varre todas as placas de rede importadas (net0, net1...)
+            mapfile -t PLACAS_REDE < <(qm config $CURRENT_VMID | grep '^net[0-9]+:' | awk -F: '{print $1}')
+            
+            # Converte as VLANs digitadas em um array (separado por espaço)
+            IFS=' ' read -r -a VLAN_ARRAY <<< "${MAPA_VLANS[$num_vm]}"
+            
+            for idx in "${!PLACAS_REDE[@]}"; do
+                placa="${PLACAS_REDE[$idx]}"
+                OLD_NET=$(qm config $CURRENT_VMID | grep "^${placa}:" | sed "s/^${placa}: //")
+                MAC=$(echo "$OLD_NET" | grep -o -i -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
+                BRIDGE=$(echo "$OLD_NET" | grep -o 'bridge=[^,]*')
+                FIREWALL=$(echo "$OLD_NET" | grep -o 'firewall=[0-9]')
+                
+                NEW_NET="virtio"
+                [ -n "$MAC" ] && NEW_NET="${NEW_NET}=${MAC}"
+                [ -n "$BRIDGE" ] && NEW_NET="${NEW_NET},${BRIDGE}" || NEW_NET="${NEW_NET},bridge=vmbr0"
+                [ -n "$FIREWALL" ] && NEW_NET="${NEW_NET},${FIREWALL}"
+                
+                # Pega a VLAN do array de entrada na mesma ordem da placa (idx)
+                if [ -n "${VLAN_ARRAY[$idx]}" ]; then
+                    NEW_NET="${NEW_NET},tag=${VLAN_ARRAY[$idx]}"
+                fi
+                
+                # Atualiza a placa especifica
+                qm set $CURRENT_VMID --$placa "$NEW_NET"
+                log_msg "    -> Placa $placa convertida para VirtIO. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
+            done
         fi
         
-        # 5. INJEÇÃO DO SCRIPT ISO
+        # INJEÇÃO E LIMPEZA DE CD-ROM FANTASMA
         if [ "$OPT_INJECT" == "1" ]; then
+            # Remove qualquer drive vazio que veio do ESXi
+            DRIVES_CD=$(qm config $CURRENT_VMID | grep 'media=cdrom' | awk -F: '{print $1}')
+            for drive in $DRIVES_CD; do
+                qm set $CURRENT_VMID --delete "$drive"
+            done
+            # Adiciona o nosso script
             qm set $CURRENT_VMID --ide2 local:iso/pos_install_esxi.iso,media=cdrom
         fi
         
@@ -254,4 +243,4 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
 done
 
 log_msg "======================================================"
-log_msg "Lote finalizado com sucesso! Script V6 Finalizado."
+log_msg "Lote finalizado com sucesso! Script V7 concluído."
