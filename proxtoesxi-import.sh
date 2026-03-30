@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V7 (Multi-NIC Dinâmico)
+# Script de Importação Automática ESXi -> Proxmox V8 (Correção Multi-NIC)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,7 +15,7 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V7 (Multi-NIC & Limpeza de CD)."
+log_msg "Iniciando sistema de importação V8 (Correção Multi-NIC)."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
@@ -180,17 +180,15 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
             
             DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata|virtio)[0-9]+:' | grep -v 'cdrom' | head -n 1 | awk -F: '{print $1}')
             
-            # Seta o hardware base
             qm set $CURRENT_VMID --sockets 1 --cores $TOTAL_CORES --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
             
             if [ -n "$DISCO_BOOT" ]; then
                 qm set $CURRENT_VMID --boot "order=$DISCO_BOOT"
             fi
             
-            # MOTOR MULTI-NIC: Varre todas as placas de rede importadas (net0, net1...)
-            mapfile -t PLACAS_REDE < <(qm config $CURRENT_VMID | grep '^net[0-9]+:' | awk -F: '{print $1}')
+            # MOTOR MULTI-NIC CORRIGIDO: Flag -E adicionada ao grep
+            mapfile -t PLACAS_REDE < <(qm config $CURRENT_VMID | grep -E '^net[0-9]+:' | awk -F: '{print $1}')
             
-            # Converte as VLANs digitadas em um array (separado por espaço)
             IFS=' ' read -r -a VLAN_ARRAY <<< "${MAPA_VLANS[$num_vm]}"
             
             for idx in "${!PLACAS_REDE[@]}"; do
@@ -205,25 +203,20 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
                 [ -n "$BRIDGE" ] && NEW_NET="${NEW_NET},${BRIDGE}" || NEW_NET="${NEW_NET},bridge=vmbr0"
                 [ -n "$FIREWALL" ] && NEW_NET="${NEW_NET},${FIREWALL}"
                 
-                # Pega a VLAN do array de entrada na mesma ordem da placa (idx)
                 if [ -n "${VLAN_ARRAY[$idx]}" ]; then
                     NEW_NET="${NEW_NET},tag=${VLAN_ARRAY[$idx]}"
                 fi
                 
-                # Atualiza a placa especifica
                 qm set $CURRENT_VMID --$placa "$NEW_NET"
                 log_msg "    -> Placa $placa convertida para VirtIO. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
             done
         fi
         
-        # INJEÇÃO E LIMPEZA DE CD-ROM FANTASMA
         if [ "$OPT_INJECT" == "1" ]; then
-            # Remove qualquer drive vazio que veio do ESXi
             DRIVES_CD=$(qm config $CURRENT_VMID | grep 'media=cdrom' | awk -F: '{print $1}')
             for drive in $DRIVES_CD; do
                 qm set $CURRENT_VMID --delete "$drive"
             done
-            # Adiciona o nosso script
             qm set $CURRENT_VMID --ide2 local:iso/pos_install_esxi.iso,media=cdrom
         fi
         
@@ -243,4 +236,4 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
 done
 
 log_msg "======================================================"
-log_msg "Lote finalizado com sucesso! Script V7 concluído."
+log_msg "Lote finalizado com sucesso! Script V8 concluído."
