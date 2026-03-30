@@ -20,9 +20,9 @@ OPT_PREFLIGHT="0"    # Desliga VM e consolida Snapshot no ESXi (Modos 1 e 2)
 OPT_RELIGAR="0"      # Religa a VM no ESXi após sucesso da cópia
 
 # Informações de Origem (Ajuste conforme o Modo escolhido acima)
-ESXI_HOST="172.16.180.190"              # Obrigatório se PREFLIGHT=1 ou RELIGAR=1 ou MODO=2
-ESXI_USER="root"                        # Usuário via SSH Keys
-STORAGE_ORIGEM="dl380-vms"              # Obrigatório para Modo 1
+ESXI_HOST="IP"              # Obrigatório se PREFLIGHT=1 ou RELIGAR=1 ou MODO=2
+ESXI_USER="user"                        # Usuário via SSH Keys
+STORAGE_ORIGEM="storage-proxmox-esxi-name"              # Obrigatório para Modo 1
 DS_NOME="datastore1"                    # Obrigatório para Modo 2
 USB_PATH="/mnt/hdd_bkp/VM_UNIFI_BACKUP" # Obrigatório para Modo 3
 
