@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V12 (Power ON Origem)
+# Script de Importação Automática ESXi -> Proxmox V13 (Controle Granular Per-VM)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,7 +15,7 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V12 (Fallback Origem)."
+log_msg "Iniciando sistema de importação V13 (Controle Granular)."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
@@ -56,16 +56,16 @@ processar_saida() {
 }
 
 # ================= SELETORES DE AUTOMAÇÃO =================
-echo -e "\n=== OPÇÕES DE PÓS-IMPORTAÇÃO ==="
+echo -e "\n=== OPÇÕES GLOBAIS DE PÓS-IMPORTAÇÃO ==="
 read -p "Deseja informar VLANs para as VMs? [1] Sim / [2] Não: " OPT_VLAN
 read -p "Aplicar mutação cirúrgica de Hardware (CPU Host, etc)? [1] Sim / [2] Não: " OPT_HW
 read -p "Disponibilizar script pós-instalação via CD-ROM virtual? [1] Sim / [2] Não: " OPT_INJECT
 read -p "Ligar as VMs NO PROXMOX automaticamente após a importação? [1] Sim / [2] Não: " OPT_START
-read -p "Religar as VMs NO ESXI DE ORIGEM após importação com sucesso? [1] Sim / [2] Não: " OPT_RELIGAR
+read -p "Deseja configurar o religamento no ESXi DE ORIGEM? [1] Sim / [2] Não: " OPT_RELIGAR_GLOBAL
 
 # Teste de Conexão SSH para o ESXi
 SSH_VALIDO=0
-if [ "$OPT_RELIGAR" == "1" ]; then
+if [ "$OPT_RELIGAR_GLOBAL" == "1" ]; then
     echo -e "\n=== CREDENCIAIS DO ESXI ==="
     while [ "$SSH_VALIDO" == "0" ]; do
         read -p "IP do servidor ESXi de origem: " ESXI_HOST
@@ -74,7 +74,6 @@ if [ "$OPT_RELIGAR" == "1" ]; then
         echo ""
         
         log_msg "[*] Testando conexão SSH com $ESXI_HOST..."
-        # O ConnectTimeout evita que o script trave se o IP for inválido
         if sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$ESXI_USER@$ESXI_HOST" "echo OK" &>/dev/null; then
             log_msg "[v] Conexão SSH estabelecida com sucesso!"
             SSH_VALIDO=1
@@ -82,7 +81,7 @@ if [ "$OPT_RELIGAR" == "1" ]; then
             echo -e "\n[x] ERRO: Falha de autenticação ou conexão com o ESXi."
             read -p "Deseja [1] Tentar novamente, [2] Ignorar e não religar as VMs lá? " ESCOLHA_SSH
             if [ "$ESCOLHA_SSH" == "2" ]; then
-                OPT_RELIGAR="2"
+                OPT_RELIGAR_GLOBAL="2"
                 log_msg "[!] Recurso de religar na origem cancelado pelo usuário."
                 break
             fi
@@ -185,15 +184,25 @@ else
     for num in $ESCOLHA_USER; do VMS_PARA_IMPORTAR+=("$num"); done
 fi
 
+# ================= CONFIGURAÇÕES INDIVIDUAIS POR VM =================
 declare -A MAPA_VLANS
-if [ "$OPT_VLAN" == "1" ]; then
-    echo -e "\n=== CONFIGURAÇÃO DE VLAN ==="
-    echo "DICA: Se a VM tiver mais de 1 placa, digite as VLANs na ordem separadas por espaço (ex: 321 305)."
-    echo "DICA: Pressione Enter para deixar sem VLAN."
+declare -A MAPA_RELIGAR
+
+if [ "$OPT_VLAN" == "1" ] || [ "$OPT_RELIGAR_GLOBAL" == "1" ]; then
+    echo -e "\n=== CONFIGURAÇÕES INDIVIDUAIS ==="
     for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
         nome_limpo=$(echo "${MAPA_VMS[$num_vm]}" | awk -F'/' '{print $2 " / " $NF}')
-        read -p "VLAN(s) para [$nome_limpo]: " vlan_input
-        MAPA_VLANS[$num_vm]=$vlan_input
+        echo -e "\n[*] Planejando VM: [$nome_limpo]"
+        
+        if [ "$OPT_VLAN" == "1" ]; then
+            read -p "    -> VLAN(s) (separadas por espaço, Enter para vazio): " vlan_input
+            MAPA_VLANS[$num_vm]=$vlan_input
+        fi
+        
+        if [ "$OPT_RELIGAR_GLOBAL" == "1" ] && [ "$SSH_VALIDO" == "1" ]; then
+            read -p "    -> Religar esta VM no ESXi ao concluir? [1] Sim / [2] Não: " religar_input
+            MAPA_RELIGAR[$num_vm]=$religar_input
+        fi
     done
 fi
 
@@ -253,7 +262,7 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
                 fi
                 
                 qm set $CURRENT_VMID --$placa "$NEW_NET"
-                log_msg "    -> Placa $placa convertida. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
+                log_msg "    -> Placa $placa convertida para VirtIO. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
             done
         fi
         
@@ -265,8 +274,8 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
             qm set $CURRENT_VMID --ide2 local:iso/pos_install_esxi.iso,media=cdrom
         fi
         
-        # RELIGAR NO ESXI
-        if [ "$OPT_RELIGAR" == "1" ] && [ "$SSH_VALIDO" == "1" ]; then
+        # RELIGAR NO ESXI (Agora individualmente por VM)
+        if [ "${MAPA_RELIGAR[$num_vm]}" == "1" ] && [ "$SSH_VALIDO" == "1" ]; then
             log_msg "[*] Localizando $ARQUIVO_VMX no ESXi de origem para religar..."
             ESXI_VMID=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/getallvms" | grep "$ARQUIVO_VMX" | awk '{print $1}' | head -n 1)
             
@@ -304,4 +313,4 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
 done
 
 log_msg "======================================================"
-log_msg "Lote finalizado com sucesso! Script V12 concluído."
+log_msg "Lote finalizado com sucesso! Script V13 concluído."
