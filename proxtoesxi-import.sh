@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V9 (ISO Multi-NIC)
+# Script de Importação Automática ESXi -> Proxmox V10 (CPU Host & Multi-NIC)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,7 +15,7 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V9 (Post-Install Multi-NIC)."
+log_msg "Iniciando sistema de importação V10 (CPU Host)."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
@@ -68,7 +68,6 @@ LOG="/root/migracao_completa.log"
 log() { echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG"; }
 log "=== Iniciando validacao de rede e agentes ==="
 
-# Coleta arrays com todas as interfaces
 mapfile -t NEW_IFS < <(ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|altname')
 mapfile -t OLD_IFS < <(awk '/^iface/ && $2 != "lo" {print $2}' /etc/network/interfaces | sort -u)
 
@@ -82,7 +81,6 @@ ALTERADO=0
 for i in "${!OLD_IFS[@]}"; do
     if [ -n "${NEW_IFS[$i]}" ] && [ "${OLD_IFS[$i]}" != "${NEW_IFS[$i]}" ]; then
         log "Atualizando ${OLD_IFS[$i]} -> ${NEW_IFS[$i]}..."
-        # O limitador de borda de palavra (\b) garante substituicao exata
         sed -i "s/\b${OLD_IFS[$i]}\b/${NEW_IFS[$i]}/g" /etc/network/interfaces
         ALTERADO=1
     fi
@@ -197,7 +195,8 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
             
             DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata|virtio)[0-9]+:' | grep -v 'cdrom' | head -n 1 | awk -F: '{print $1}')
             
-            qm set $CURRENT_VMID --sockets 1 --cores $TOTAL_CORES --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
+            # --- ATUALIZAÇÃO V10: INSERIDO --cpu host ---
+            qm set $CURRENT_VMID --sockets 1 --cores $TOTAL_CORES --cpu host --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
             
             if [ -n "$DISCO_BOOT" ]; then
                 qm set $CURRENT_VMID --boot "order=$DISCO_BOOT"
@@ -251,4 +250,4 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
 done
 
 log_msg "======================================================"
-log_msg "Lote finalizado com sucesso! Script V9 concluído."
+log_msg "Lote finalizado com sucesso! Script V10 concluído."
