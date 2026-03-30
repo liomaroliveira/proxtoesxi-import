@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V11 (CPU Host & Multi-NIC)
+# Script de Importação Automática ESXi -> Proxmox V12 (Power ON Origem)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,14 +15,17 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V11."
+log_msg "Iniciando sistema de importação V12 (Fallback Origem)."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
-if ! command -v genisoimage &> /dev/null; then
-    log_msg "[*] Instalando 'genisoimage' para criação do CD virtual..."
-    apt-get update >/dev/null && apt-get install genisoimage -y >/dev/null
-fi
+# Instala dependências críticas
+for pkg in genisoimage sshpass; do
+    if ! command -v $pkg &> /dev/null; then
+        log_msg "[*] Instalando pacote ausente: $pkg..."
+        apt-get update >/dev/null && apt-get install $pkg -y >/dev/null
+    fi
+done
 
 cleanup() {
     log_msg "\n[!] AVISO: INTERRUPÇÃO DETECTADA (Ctrl+C)!"
@@ -57,7 +60,35 @@ echo -e "\n=== OPÇÕES DE PÓS-IMPORTAÇÃO ==="
 read -p "Deseja informar VLANs para as VMs? [1] Sim / [2] Não: " OPT_VLAN
 read -p "Aplicar mutação cirúrgica de Hardware (CPU Host, etc)? [1] Sim / [2] Não: " OPT_HW
 read -p "Disponibilizar script pós-instalação via CD-ROM virtual? [1] Sim / [2] Não: " OPT_INJECT
-read -p "Ligar as VMs automaticamente após a importação? [1] Sim / [2] Não: " OPT_START
+read -p "Ligar as VMs NO PROXMOX automaticamente após a importação? [1] Sim / [2] Não: " OPT_START
+read -p "Religar as VMs NO ESXI DE ORIGEM após importação com sucesso? [1] Sim / [2] Não: " OPT_RELIGAR
+
+# Teste de Conexão SSH para o ESXi
+SSH_VALIDO=0
+if [ "$OPT_RELIGAR" == "1" ]; then
+    echo -e "\n=== CREDENCIAIS DO ESXI ==="
+    while [ "$SSH_VALIDO" == "0" ]; do
+        read -p "IP do servidor ESXi de origem: " ESXI_HOST
+        read -p "Usuário SSH do ESXi (ex: root): " ESXI_USER
+        read -s -p "Senha do ESXi: " ESXI_PASS
+        echo ""
+        
+        log_msg "[*] Testando conexão SSH com $ESXI_HOST..."
+        # O ConnectTimeout evita que o script trave se o IP for inválido
+        if sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$ESXI_USER@$ESXI_HOST" "echo OK" &>/dev/null; then
+            log_msg "[v] Conexão SSH estabelecida com sucesso!"
+            SSH_VALIDO=1
+        else
+            echo -e "\n[x] ERRO: Falha de autenticação ou conexão com o ESXi."
+            read -p "Deseja [1] Tentar novamente, [2] Ignorar e não religar as VMs lá? " ESCOLHA_SSH
+            if [ "$ESCOLHA_SSH" == "2" ]; then
+                OPT_RELIGAR="2"
+                log_msg "[!] Recurso de religar na origem cancelado pelo usuário."
+                break
+            fi
+        fi
+    done
+fi
 
 if [ "$OPT_INJECT" == "1" ]; then
     log_msg "Gerando ISO com script de pós-instalação Multi-NIC..."
@@ -174,6 +205,7 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
     caminho_vm="${MAPA_VMS[$num_vm]}"
     CURRENT_VMID=$(pvesh get /cluster/nextid)
     nome_limpo=$(echo "$caminho_vm" | awk -F'/' '{print $2 " / " $NF}')
+    ARQUIVO_VMX=$(basename "$caminho_vm")
     
     log_msg "------------------------------------------------------"
     log_msg "Importando: [$num_vm] $nome_limpo -> ID $CURRENT_VMID"
@@ -195,7 +227,6 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
             
             DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata|virtio)[0-9]+:' | grep -v 'cdrom' | head -n 1 | awk -F: '{print $1}')
             
-            # --- MUTAÇÃO BASE COM CPU HOST INJETADA ---
             qm set $CURRENT_VMID --sockets 1 --cores $TOTAL_CORES --cpu host --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
             
             if [ -n "$DISCO_BOOT" ]; then
@@ -222,7 +253,7 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
                 fi
                 
                 qm set $CURRENT_VMID --$placa "$NEW_NET"
-                log_msg "    -> Placa $placa convertida para VirtIO. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
+                log_msg "    -> Placa $placa convertida. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
             done
         fi
         
@@ -234,8 +265,31 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
             qm set $CURRENT_VMID --ide2 local:iso/pos_install_esxi.iso,media=cdrom
         fi
         
+        # RELIGAR NO ESXI
+        if [ "$OPT_RELIGAR" == "1" ] && [ "$SSH_VALIDO" == "1" ]; then
+            log_msg "[*] Localizando $ARQUIVO_VMX no ESXi de origem para religar..."
+            ESXI_VMID=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/getallvms" | grep "$ARQUIVO_VMX" | awk '{print $1}' | head -n 1)
+            
+            if [ -n "$ESXI_VMID" ]; then
+                ESTADO_ANTES=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.getstate $ESXI_VMID" | grep -i 'Powered')
+                log_msg "    -> Estado atual no ESXi (ID $ESXI_VMID): $ESTADO_ANTES"
+                
+                if echo "$ESTADO_ANTES" | grep -qi "Powered off"; then
+                    log_msg "    -> Enviando comando de Power ON no ESXi..."
+                    sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.on $ESXI_VMID" > /dev/null
+                    sleep 3
+                    ESTADO_DEPOIS=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.getstate $ESXI_VMID" | grep -i 'Powered')
+                    log_msg "    -> Novo estado no ESXi: $ESTADO_DEPOIS"
+                else
+                    log_msg "    -> A VM já está ligada no ESXi. Nenhuma ação extra."
+                fi
+            else
+                log_msg "[x] ERRO: Arquivo $ARQUIVO_VMX não encontrado na lista de VMs do ESXi."
+            fi
+        fi
+
         if [ "$OPT_START" == "1" ]; then
-            log_msg "[*] Ligando a VM $CURRENT_VMID..."
+            log_msg "[*] Ligando a VM $CURRENT_VMID no Proxmox..."
             qm start $CURRENT_VMID
         fi
         
@@ -250,4 +304,4 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
 done
 
 log_msg "======================================================"
-log_msg "Lote finalizado com sucesso! Script V11 concluído."
+log_msg "Lote finalizado com sucesso! Script V12 concluído."
