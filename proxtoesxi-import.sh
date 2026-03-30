@@ -172,8 +172,7 @@ log_msg "Iniciando fila..."
 
 for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
     caminho_vm="${MAPA_VMS[$num_vm]}"
-    CURRENT_VMID=$(presh get /cluster/nextid) # fallback se pvesh falhar
-    CURRENT_VMID=$(pvesh get /cluster/nextid 2>/dev/null || pvesh get /cluster/nextid)
+    CURRENT_VMID=$(pvesh get /cluster/nextid)
     nome_limpo=$(echo "$caminho_vm" | awk -F'/' '{print $2 " / " $NF}')
     
     log_msg "------------------------------------------------------"
