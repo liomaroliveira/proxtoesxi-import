@@ -53,7 +53,7 @@ Execute no terminal do **Proxmox**:
 
 ## 🧠 Configuração do Motor (O Cérebro do Script)
 
-Antes de executar, edite as variáveis no topo do arquivo `importacao_v15.sh`. Este é o painel de controle que dita o comportamento do script:
+Antes de executar, edite as variáveis no topo do arquivo `proxtoesxi-import.sh`. Este é o painel de controle que dita o comportamento do script:
 
 ```bash
 MODO_IMPORT="3"          # 1=Plugin, 2=SSHFS, 3=USB
@@ -85,8 +85,8 @@ A variável de array `VMS_TARGET` define o lote de execução. A sintaxe rigoros
 Ideal para validar a configuração das variáveis antes de agendar.
 
 ```
-chmod +x importacao_v15.sh
-./importacao_v15.sh
+chmod +x proxtoesxi-import.sh
+./proxtoesxi-import.sh
 ```
 
 ### Opção B: Operação Autônoma (Agendador Cron)
@@ -102,7 +102,7 @@ Para rodar massivamente durante a madrugada sem dependência de terminal aberto.
 2. Adicione a linha abaixo no final do arquivo (Exemplo: execução programada para todos os dias às **02:00 AM**):
     
     ```bash
-    0 2 * * * /caminho/absoluto/para/importacao_v15.sh > /dev/null 2>&1
+    0 2 * * * /caminho/absoluto/para/proxtoesxi-cron.sh > /dev/null 2>&1
     ```
     
 
