@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V8 (Correção Multi-NIC)
+# Script de Importação Automática ESXi -> Proxmox V9 (ISO Multi-NIC)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,7 +15,7 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V8 (Correção Multi-NIC)."
+log_msg "Iniciando sistema de importação V9 (Post-Install Multi-NIC)."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
@@ -60,25 +60,42 @@ read -p "Disponibilizar script pós-instalação via CD-ROM virtual? [1] Sim / [
 read -p "Ligar as VMs automaticamente após a importação? [1] Sim / [2] Não: " OPT_START
 
 if [ "$OPT_INJECT" == "1" ]; then
-    log_msg "Gerando ISO com script de pós-instalação..."
+    log_msg "Gerando ISO com script de pós-instalação Multi-NIC..."
     TMP_DIR=$(mktemp -d)
     cat << 'EOF' > "$TMP_DIR/pos_import_esxi.sh"
 #!/bin/bash
 LOG="/root/migracao_completa.log"
 log() { echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG"; }
 log "=== Iniciando validacao de rede e agentes ==="
-NEW_IF=$(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo\|altname' | head -n 1)
-OLD_IF=$(awk '/^iface/ && $2 != "lo" {print $2; exit}' /etc/network/interfaces)
-log "Hardware detectado: $NEW_IF | Config atual: $OLD_IF"
-if [ -z "$NEW_IF" ] || [ -z "$OLD_IF" ]; then log "ERRO: Interfaces nao detectadas. Abortando."; exit 1; fi
-if [ "$NEW_IF" != "$OLD_IF" ]; then
-    log "Atualizando $OLD_IF -> $NEW_IF..."
-    sed -i "s/$OLD_IF/$NEW_IF/g" /etc/network/interfaces
+
+# Coleta arrays com todas as interfaces
+mapfile -t NEW_IFS < <(ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|altname')
+mapfile -t OLD_IFS < <(awk '/^iface/ && $2 != "lo" {print $2}' /etc/network/interfaces | sort -u)
+
+log "Hardware detectado: ${NEW_IFS[*]} | Config atual: ${OLD_IFS[*]}"
+
+if [ ${#NEW_IFS[@]} -eq 0 ] || [ ${#OLD_IFS[@]} -eq 0 ]; then
+    log "ERRO: Interfaces nao detectadas. Abortando."; exit 1
+fi
+
+ALTERADO=0
+for i in "${!OLD_IFS[@]}"; do
+    if [ -n "${NEW_IFS[$i]}" ] && [ "${OLD_IFS[$i]}" != "${NEW_IFS[$i]}" ]; then
+        log "Atualizando ${OLD_IFS[$i]} -> ${NEW_IFS[$i]}..."
+        # O limitador de borda de palavra (\b) garante substituicao exata
+        sed -i "s/\b${OLD_IFS[$i]}\b/${NEW_IFS[$i]}/g" /etc/network/interfaces
+        ALTERADO=1
+    fi
+done
+
+if [ $ALTERADO -eq 1 ]; then
+    log "Reiniciando servico de rede..."
     systemctl restart networking
     sleep 5
 else
     log "Nomes corretos. Nenhuma alteracao necessaria."
 fi
+
 log "Testando conectividade..."
 if ping -c 3 google.com &> /dev/null; then
     log "SUCESSO: Conectividade confirmada!"
@@ -186,9 +203,7 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
                 qm set $CURRENT_VMID --boot "order=$DISCO_BOOT"
             fi
             
-            # MOTOR MULTI-NIC CORRIGIDO: Flag -E adicionada ao grep
             mapfile -t PLACAS_REDE < <(qm config $CURRENT_VMID | grep -E '^net[0-9]+:' | awk -F: '{print $1}')
-            
             IFS=' ' read -r -a VLAN_ARRAY <<< "${MAPA_VLANS[$num_vm]}"
             
             for idx in "${!PLACAS_REDE[@]}"; do
@@ -208,7 +223,7 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
                 fi
                 
                 qm set $CURRENT_VMID --$placa "$NEW_NET"
-                log_msg "    -> Placa $placa convertida para VirtIO. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
+                log_msg "    -> Placa $placa convertida. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
             done
         fi
         
@@ -236,4 +251,4 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
 done
 
 log_msg "======================================================"
-log_msg "Lote finalizado com sucesso! Script V8 concluído."
+log_msg "Lote finalizado com sucesso! Script V9 concluído."
