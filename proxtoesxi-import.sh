@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V13 (Controle Granular Per-VM)
+# ESXi to Proxmox Migration Toolkit V14 (Enterprise Edition)
+# Desenvolvido para migrações via Plugin, SSHFS ou USB.
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,12 +16,12 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V13 (Controle Granular)."
+log_msg "Iniciando ESXi Migration Toolkit V14."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
-# Instala dependências críticas
-for pkg in genisoimage sshpass; do
+# 1. Instalação de Dependências
+for pkg in genisoimage sshpass sshfs jq; do
     if ! command -v $pkg &> /dev/null; then
         log_msg "[*] Instalando pacote ausente: $pkg..."
         apt-get update >/dev/null && apt-get install $pkg -y >/dev/null
@@ -34,6 +35,7 @@ cleanup() {
         log_msg "[*] Removendo VM incompleta ($CURRENT_VMID)..."
         qm destroy $CURRENT_VMID --purge 1 >> "$LOG_FILE" 2>&1
     fi
+    umount -f /mnt/esxi_sshfs &>/dev/null
     exit 1
 }
 trap cleanup SIGINT SIGTERM
@@ -55,19 +57,26 @@ processar_saida() {
     if [[ $prev_was_trans -eq 1 ]]; then echo ""; echo "[$(date +'%Y-%m-%d %H:%M:%S')] $last_trans" >> "$LOG_FILE"; fi
 }
 
-# ================= SELETORES DE AUTOMAÇÃO =================
-echo -e "\n=== OPÇÕES GLOBAIS DE PÓS-IMPORTAÇÃO ==="
+# ================= MENU PRINCIPAL =================
+echo -e "\n=== MODO DE IMPORTAÇÃO ==="
+echo "[1] Via Storage Plugin Proxmox (Padrão, mais seguro)"
+echo "[2] Via SSHFS (Monta o ESXi remoto, ideal para contornar falhas de API)"
+echo "[3] Via USB/Armazenamento Local (Para backups offline)"
+read -p "Sua escolha [1-3]: " MODO_IMPORT
+
+echo -e "\n=== OPÇÕES GLOBAIS ==="
 read -p "Deseja informar VLANs para as VMs? [1] Sim / [2] Não: " OPT_VLAN
-read -p "Aplicar mutação cirúrgica de Hardware (CPU Host, etc)? [1] Sim / [2] Não: " OPT_HW
 read -p "Disponibilizar script pós-instalação via CD-ROM virtual? [1] Sim / [2] Não: " OPT_INJECT
 read -p "Ligar as VMs NO PROXMOX automaticamente após a importação? [1] Sim / [2] Não: " OPT_START
-read -p "Deseja configurar o religamento no ESXi DE ORIGEM? [1] Sim / [2] Não: " OPT_RELIGAR_GLOBAL
 
-# Teste de Conexão SSH para o ESXi
+# Credenciais SSH (Necessário para Pre-Flight de Modo 1 e Modo 2)
 SSH_VALIDO=0
-if [ "$OPT_RELIGAR_GLOBAL" == "1" ]; then
-    echo -e "\n=== CREDENCIAIS DO ESXI ==="
-    while [ "$SSH_VALIDO" == "0" ]; do
+if [ "$MODO_IMPORT" == "1" ] || [ "$MODO_IMPORT" == "2" ]; then
+    echo -e "\n=== CREDENCIAIS DO ESXI (Para Snapshot/Desligamento) ==="
+    read -p "Deseja aplicar Pre-Flight (Desligar + Consolidar Snapshots) via SSH? [1] Sim / [2] Não: " OPT_PREFLIGHT
+    read -p "Religar a VM no ESXi após concluir com sucesso? [1] Sim / [2] Não: " OPT_RELIGAR_GLOBAL
+    
+    if [ "$OPT_PREFLIGHT" == "1" ] || [ "$OPT_RELIGAR_GLOBAL" == "1" ] || [ "$MODO_IMPORT" == "2" ]; then
         read -p "IP do servidor ESXi de origem: " ESXI_HOST
         read -p "Usuário SSH do ESXi (ex: root): " ESXI_USER
         read -s -p "Senha do ESXi: " ESXI_PASS
@@ -75,66 +84,43 @@ if [ "$OPT_RELIGAR_GLOBAL" == "1" ]; then
         
         log_msg "[*] Testando conexão SSH com $ESXI_HOST..."
         if sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$ESXI_USER@$ESXI_HOST" "echo OK" &>/dev/null; then
-            log_msg "[v] Conexão SSH estabelecida com sucesso!"
+            log_msg "[v] Conexão SSH estabelecida."
             SSH_VALIDO=1
         else
-            echo -e "\n[x] ERRO: Falha de autenticação ou conexão com o ESXi."
-            read -p "Deseja [1] Tentar novamente, [2] Ignorar e não religar as VMs lá? " ESCOLHA_SSH
-            if [ "$ESCOLHA_SSH" == "2" ]; then
-                OPT_RELIGAR_GLOBAL="2"
-                log_msg "[!] Recurso de religar na origem cancelado pelo usuário."
-                break
-            fi
+            log_msg "[x] Falha SSH. Funcionalidades de controle remoto desativadas."
+            OPT_PREFLIGHT="2"; OPT_RELIGAR_GLOBAL="2"
+            if [ "$MODO_IMPORT" == "2" ]; then log_msg "Modo SSHFS abortado por falha de login."; exit 1; fi
         fi
-    done
+    fi
+else
+    OPT_PREFLIGHT="2"; OPT_RELIGAR_GLOBAL="2"
 fi
 
+# Cria o ISO do Agent
 if [ "$OPT_INJECT" == "1" ]; then
-    log_msg "Gerando ISO com script de pós-instalação Multi-NIC..."
+    log_msg "Gerando ISO pós-instalação..."
     TMP_DIR=$(mktemp -d)
     cat << 'EOF' > "$TMP_DIR/pos_import_esxi.sh"
 #!/bin/bash
 LOG="/root/migracao_completa.log"
 log() { echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG"; }
 log "=== Iniciando validacao de rede e agentes ==="
-
 mapfile -t NEW_IFS < <(ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|altname')
 mapfile -t OLD_IFS < <(awk '/^iface/ && $2 != "lo" {print $2}' /etc/network/interfaces | sort -u)
-
-log "Hardware detectado: ${NEW_IFS[*]} | Config atual: ${OLD_IFS[*]}"
-
-if [ ${#NEW_IFS[@]} -eq 0 ] || [ ${#OLD_IFS[@]} -eq 0 ]; then
-    log "ERRO: Interfaces nao detectadas. Abortando."; exit 1
-fi
-
+if [ ${#NEW_IFS[@]} -eq 0 ]; then log "ERRO: Interfaces nao detectadas."; exit 1; fi
 ALTERADO=0
 for i in "${!OLD_IFS[@]}"; do
     if [ -n "${NEW_IFS[$i]}" ] && [ "${OLD_IFS[$i]}" != "${NEW_IFS[$i]}" ]; then
-        log "Atualizando ${OLD_IFS[$i]} -> ${NEW_IFS[$i]}..."
         sed -i "s/\b${OLD_IFS[$i]}\b/${NEW_IFS[$i]}/g" /etc/network/interfaces
         ALTERADO=1
     fi
 done
-
-if [ $ALTERADO -eq 1 ]; then
-    log "Reiniciando servico de rede..."
-    systemctl restart networking
-    sleep 5
-else
-    log "Nomes corretos. Nenhuma alteracao necessaria."
-fi
-
-log "Testando conectividade..."
+if [ $ALTERADO -eq 1 ]; then systemctl restart networking; sleep 5; fi
 if ping -c 3 google.com &> /dev/null; then
-    log "SUCESSO: Conectividade confirmada!"
-    apt-get update -y &>> "$LOG"
-    apt-get install qemu-guest-agent -y &>> "$LOG"
-    systemctl enable --now qemu-guest-agent
-    apt-get purge open-vm-tools -y &>> "$LOG"
-    apt-get autoremove -y &>> "$LOG"
-    log "=== Concluido com sucesso! ==="
+    apt-get update -y && apt-get install qemu-guest-agent -y && systemctl enable --now qemu-guest-agent && apt-get purge open-vm-tools -y && apt-get autoremove -y
+    log "SUCESSO: Agent instalado."
 else
-    log "FALHA: Sem internet. Abortando para evitar quebra."; exit 1
+    log "FALHA: Sem internet. Abortando."; exit 1
 fi
 EOF
     chmod +x "$TMP_DIR/pos_import_esxi.sh"
@@ -142,40 +128,46 @@ EOF
     rm -rf "$TMP_DIR"
 fi
 
-# ================= BUSCA DE STORAGES E VMS =================
-echo -e "\nBuscando storages do tipo ESXi..."
-mapfile -t ESXI_STORAGES < <(pvesm status | awk 'NR>1 && $2=="esxi" {print $1}')
-if [ ${#ESXI_STORAGES[@]} -eq 0 ]; then log_msg "Erro: Nenhum storage ESXi."; exit 1; fi
-
-for i in "${!ESXI_STORAGES[@]}"; do echo "[$((i+1))] ${ESXI_STORAGES[$i]}"; done
-read -p "Digite o NÚMERO da origem: " NUM_ORIGEM
-STORAGE_ORIGEM="${ESXI_STORAGES[$((NUM_ORIGEM-1))]}"
-
-mapfile -t VMS_BRUTAS < <(pvesm list "$STORAGE_ORIGEM" | awk 'NR>1 {print $1}' | grep "\.vmx$")
+# ================= BUSCA DE VMS =================
 declare -A MAPA_VMS
-for i in "${!VMS_BRUTAS[@]}"; do MAPA_VMS[$((i+1))]="${VMS_BRUTAS[$i]}"; done
+if [ "$MODO_IMPORT" == "1" ]; then
+    mapfile -t ESXI_STORAGES < <(pvesm status | awk 'NR>1 && $2=="esxi" {print $1}')
+    for i in "${!ESXI_STORAGES[@]}"; do echo "[$((i+1))] ${ESXI_STORAGES[$i]}"; done
+    read -p "Selecione o storage origem: " n_origem
+    STORAGE_ORIGEM="${ESXI_STORAGES[$((n_origem-1))]}"
+    mapfile -t VMS_BRUTAS < <(pvesm list "$STORAGE_ORIGEM" | awk 'NR>1 {print $1}' | grep "\.vmx$")
+    for i in "${!VMS_BRUTAS[@]}"; do MAPA_VMS[$((i+1))]="${VMS_BRUTAS[$i]}"; done
 
-mapfile -t DEST_STORAGES < <(pvesm status | awk 'NR>1 && $4>0 {print $1, $2, $4, $6}')
-declare -A MAPA_DESTINO
-idx=1
-for info in "${DEST_STORAGES[@]}"; do
-    read -r nome_st tipo_st total_kb livre_kb <<< "$info"
-    total_gb=$(awk "BEGIN {printf \"%.2f\", $total_kb / 1048576}")
-    livre_gb=$(awk "BEGIN {printf \"%.2f\", $livre_kb / 1048576}")
-    echo "[$idx] $nome_st | Tipo: $tipo_st | Total: $total_gb GB | Livre: $livre_gb GB"
-    MAPA_DESTINO[$idx]=$nome_st
-    ((idx++))
-done
-read -p "Digite o NÚMERO do destino: " NUM_DESTINO
-STORAGE_DESTINO="${MAPA_DESTINO[$NUM_DESTINO]}"
+elif [ "$MODO_IMPORT" == "2" ]; then
+    mkdir -p /mnt/esxi_sshfs
+    log_msg "[*] Montando Datastore remoto via SSHFS..."
+    echo "$ESXI_PASS" | sshfs "$ESXI_USER@$ESXI_HOST:/vmfs/volumes" /mnt/esxi_sshfs -o password_stdin,StrictHostKeyChecking=no,allow_other
+    read -p "Digite o NOME do Datastore no ESXi (ex: datastore1): " DS_NOME
+    log_msg "[*] Mapeando VMs no datastore $DS_NOME..."
+    mapfile -t VMS_BRUTAS < <(find /mnt/esxi_sshfs/$DS_NOME -maxdepth 2 -name "*.vmx")
+    for i in "${!VMS_BRUTAS[@]}"; do MAPA_VMS[$((i+1))]="${VMS_BRUTAS[$i]}"; done
 
+elif [ "$MODO_IMPORT" == "3" ]; then
+    read -p "Digite o caminho absoluto do diretório (ex: /mnt/hdd_bkp/VM_UNIFI_BACKUP): " USB_PATH
+    log_msg "[*] Mapeando VMs em $USB_PATH..."
+    mapfile -t VMS_BRUTAS < <(find "$USB_PATH" -maxdepth 2 -name "*.vmx")
+    for i in "${!VMS_BRUTAS[@]}"; do MAPA_VMS[$((i+1))]="${VMS_BRUTAS[$i]}"; done
+fi
+
+if [ ${#MAPA_VMS[@]} -eq 0 ]; then log_msg "[x] Nenhuma VM encontrada. Abortando."; exit 1; fi
+
+# Seleção de Destino
+echo -e "\nArmazenamentos de Destino:"
+mapfile -t DEST_STORAGES < <(pvesm status | awk 'NR>1 && $4>0 {print $1}')
+for i in "${!DEST_STORAGES[@]}"; do echo "[$((i+1))] ${DEST_STORAGES[$i]}"; done
+read -p "Destino: " n_dest
+STORAGE_DESTINO="${DEST_STORAGES[$((n_dest-1))]}"
+
+# Seleção de VMs
 echo -e "\n======================================================"
-for i in $(seq 1 ${#VMS_BRUTAS[@]}); do
-    NOME_EXIBICAO=$(echo "${MAPA_VMS[$i]}" | awk -F'/' '{print $2 " / " $NF}')
-    echo "[$i] $NOME_EXIBICAO"
-done
+for i in $(seq 1 ${#VMS_BRUTAS[@]}); do echo "[$i] ${MAPA_VMS[$i]}"; done
 echo "======================================================"
-read -p "VMs a importar (ex: 1 3 5) ou 'TODAS': " ESCOLHA_USER
+read -p "VMs a importar (ex: 1 3) ou 'TODAS': " ESCOLHA_USER
 
 VMS_PARA_IMPORTAR=()
 if [[ "${ESCOLHA_USER^^}" == "TODAS" ]]; then
@@ -184,25 +176,16 @@ else
     for num in $ESCOLHA_USER; do VMS_PARA_IMPORTAR+=("$num"); done
 fi
 
-# ================= CONFIGURAÇÕES INDIVIDUAIS POR VM =================
+# Configurações Individuais
 declare -A MAPA_VLANS
 declare -A MAPA_RELIGAR
-
 if [ "$OPT_VLAN" == "1" ] || [ "$OPT_RELIGAR_GLOBAL" == "1" ]; then
-    echo -e "\n=== CONFIGURAÇÕES INDIVIDUAIS ==="
+    echo -e "\n=== SETUP INDIVIDUAL ==="
     for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
-        nome_limpo=$(echo "${MAPA_VMS[$num_vm]}" | awk -F'/' '{print $2 " / " $NF}')
-        echo -e "\n[*] Planejando VM: [$nome_limpo]"
-        
-        if [ "$OPT_VLAN" == "1" ]; then
-            read -p "    -> VLAN(s) (separadas por espaço, Enter para vazio): " vlan_input
-            MAPA_VLANS[$num_vm]=$vlan_input
-        fi
-        
-        if [ "$OPT_RELIGAR_GLOBAL" == "1" ] && [ "$SSH_VALIDO" == "1" ]; then
-            read -p "    -> Religar esta VM no ESXi ao concluir? [1] Sim / [2] Não: " religar_input
-            MAPA_RELIGAR[$num_vm]=$religar_input
-        fi
+        ARQ_NOME=$(basename "${MAPA_VMS[$num_vm]}")
+        echo -e "\n[*] VM: $ARQ_NOME"
+        if [ "$OPT_VLAN" == "1" ]; then read -p "    -> VLAN(s) (separadas por espaço): " vlan_input; MAPA_VLANS[$num_vm]=$vlan_input; fi
+        if [ "$OPT_RELIGAR_GLOBAL" == "1" ]; then read -p "    -> Religar na origem no final? [1] Sim / [2] Não: " rel_in; MAPA_RELIGAR[$num_vm]=$rel_in; fi
     done
 fi
 
@@ -213,104 +196,136 @@ log_msg "Iniciando fila..."
 for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
     caminho_vm="${MAPA_VMS[$num_vm]}"
     CURRENT_VMID=$(pvesh get /cluster/nextid)
-    nome_limpo=$(echo "$caminho_vm" | awk -F'/' '{print $2 " / " $NF}')
     ARQUIVO_VMX=$(basename "$caminho_vm")
-    
+    NOME_LIMPO=$(grep -i '^displayName' "$caminho_vm" 2>/dev/null | cut -d'"' -f2)
+    [ -z "$NOME_LIMPO" ] && NOME_LIMPO="$ARQUIVO_VMX"
+
     log_msg "------------------------------------------------------"
-    log_msg "Importando: [$num_vm] $nome_limpo -> ID $CURRENT_VMID"
-    
-    qm import $CURRENT_VMID "$caminho_vm" --storage "$STORAGE_DESTINO" > >(processar_saida) 2>&1 &
-    IMPORT_PID=$!
-    wait $IMPORT_PID
-    EXIT_CODE=$?
-    
-    if [ $EXIT_CODE -eq 0 ]; then
-        log_msg "[v] VM $CURRENT_VMID importada. Aplicando mutações..."
-        
-        if [ "$OPT_HW" == "1" ]; then
-            OLD_CORES=$(qm config $CURRENT_VMID | awk '/^cores:/ {print $2}')
-            OLD_SOCKETS=$(qm config $CURRENT_VMID | awk '/^sockets:/ {print $2}')
-            [ -z "$OLD_CORES" ] && OLD_CORES=1
-            [ -z "$OLD_SOCKETS" ] && OLD_SOCKETS=1
-            TOTAL_CORES=$((OLD_CORES * OLD_SOCKETS))
+    log_msg "Processando: [$num_vm] $NOME_LIMPO -> ID Proxmox $CURRENT_VMID"
+
+    # PRE-FLIGHT (Modo 1 e 2 via SSH)
+    if [ "$OPT_PREFLIGHT" == "1" ] && [ "$SSH_VALIDO" == "1" ]; then
+        ESXI_VMID=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/getallvms" | grep "$ARQUIVO_VMX" | awk '{print $1}' | head -n 1)
+        if [ -n "$ESXI_VMID" ]; then
+            ESTADO_ANTES=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.getstate $ESXI_VMID" | grep -i 'Powered')
+            if echo "$ESTADO_ANTES" | grep -qi "Powered on"; then
+                log_msg "    [Pre-Flight] Desligando VM no ESXi..."
+                sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.off $ESXI_VMID" > /dev/null
+                sleep 5
+            fi
+            log_msg "    [Pre-Flight] Disparando Consolidacao de Snapshots..."
+            sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/snapshot.removeall $ESXI_VMID" > /dev/null
+            
+            log_msg "    [Pre-Flight] Aguardando conclusao da consolidacao (isso pode demorar)..."
+            while sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vimsvc/task_list" | grep -qi "removeAllSnapshots"; do
+                sleep 5
+            done
+            log_msg "    [Pre-Flight] Consolidacao concluida!"
+        else
+            log_msg "    [Pre-Flight] VM não encontrada na origem para consolidar. Seguindo..."
+        fi
+    fi
+
+    # MODO 1: Importação via API NATIVA
+    if [ "$MODO_IMPORT" == "1" ]; then
+        log_msg "    -> Importando via Plugin ESXi..."
+        qm import $CURRENT_VMID "$caminho_vm" --storage "$STORAGE_DESTINO" > >(processar_saida) 2>&1 &
+        IMPORT_PID=$!
+        wait $IMPORT_PID
+        EXIT_CODE=$?
+
+        if [ $EXIT_CODE -eq 0 ]; then
+            log_msg "    -> Aplicando Mutações Nativas..."
+            OLD_CORES=$(qm config $CURRENT_VMID | awk '/^cores:/ {print $2}'); [ -z "$OLD_CORES" ] && OLD_CORES=1
+            OLD_SOCKETS=$(qm config $CURRENT_VMID | awk '/^sockets:/ {print $2}'); [ -z "$OLD_SOCKETS" ] && OLD_SOCKETS=1
+            qm set $CURRENT_VMID --sockets 1 --cores $((OLD_CORES * OLD_SOCKETS)) --cpu host --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
             
             DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata|virtio)[0-9]+:' | grep -v 'cdrom' | head -n 1 | awk -F: '{print $1}')
-            
-            qm set $CURRENT_VMID --sockets 1 --cores $TOTAL_CORES --cpu host --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
-            
-            if [ -n "$DISCO_BOOT" ]; then
-                qm set $CURRENT_VMID --boot "order=$DISCO_BOOT"
-            fi
-            
+            [ -n "$DISCO_BOOT" ] && qm set $CURRENT_VMID --boot "order=$DISCO_BOOT"
+
             mapfile -t PLACAS_REDE < <(qm config $CURRENT_VMID | grep -E '^net[0-9]+:' | awk -F: '{print $1}')
             IFS=' ' read -r -a VLAN_ARRAY <<< "${MAPA_VLANS[$num_vm]}"
-            
             for idx in "${!PLACAS_REDE[@]}"; do
                 placa="${PLACAS_REDE[$idx]}"
                 OLD_NET=$(qm config $CURRENT_VMID | grep "^${placa}:" | sed "s/^${placa}: //")
                 MAC=$(echo "$OLD_NET" | grep -o -i -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
-                BRIDGE=$(echo "$OLD_NET" | grep -o 'bridge=[^,]*')
-                FIREWALL=$(echo "$OLD_NET" | grep -o 'firewall=[0-9]')
-                
-                NEW_NET="virtio"
-                [ -n "$MAC" ] && NEW_NET="${NEW_NET}=${MAC}"
-                [ -n "$BRIDGE" ] && NEW_NET="${NEW_NET},${BRIDGE}" || NEW_NET="${NEW_NET},bridge=vmbr0"
-                [ -n "$FIREWALL" ] && NEW_NET="${NEW_NET},${FIREWALL}"
-                
-                if [ -n "${VLAN_ARRAY[$idx]}" ]; then
-                    NEW_NET="${NEW_NET},tag=${VLAN_ARRAY[$idx]}"
-                fi
-                
-                qm set $CURRENT_VMID --$placa "$NEW_NET"
-                log_msg "    -> Placa $placa convertida para VirtIO. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
+                NET_CONFIG="virtio=${MAC:-},bridge=vmbr0"
+                [ -n "${VLAN_ARRAY[$idx]}" ] && NET_CONFIG="$NET_CONFIG,tag=${VLAN_ARRAY[$idx]}"
+                qm set $CURRENT_VMID --$placa "$NET_CONFIG"
             done
         fi
+
+    # MODO 2/3: VMX PARSER + IMPORT DISK
+    else
+        log_msg "    -> Parsing do VMX via Modo Analítico (Local/SSHFS)..."
+        MEM=$(grep -i '^memSize' "$caminho_vm" | cut -d'"' -f2 | tr -d ' ')
+        CORES=$(grep -i '^numvcpus' "$caminho_vm" | cut -d'"' -f2 | tr -d ' ')
         
+        log_msg "    -> Criando Casca da VM (RAM: ${MEM:-2048}MB, Cores: ${CORES:-1})..."
+        qm create $CURRENT_VMID --name "$NOME_LIMPO" --memory "${MEM:-2048}" --sockets 1 --cores "${CORES:-1}" --cpu host --scsihw virtio-scsi-single --vga virtio --agent 1 --onboot 1
+        
+        # Parse Discos
+        EXIT_CODE=0
+        grep -i '\.fileName' "$caminho_vm" | grep -i '\.vmdk' | while read -r line; do
+            dev=$(echo "$line" | cut -d'.' -f1) # ex: scsi0:0
+            bus=$(echo "$dev" | cut -d':' -f1)  # ex: scsi0
+            vmdk_name=$(echo "$line" | cut -d'"' -f2)
+            vmdk_path="$(dirname "$caminho_vm")/$vmdk_name"
+            
+            log_msg "    -> Importando disco $vmdk_name no barramento $bus (Isso vai demorar)..."
+            qm importdisk $CURRENT_VMID "$vmdk_path" "$STORAGE_DESTINO" --format raw > /tmp/imp_${CURRENT_VMID}.log 2>&1
+            VOL=$(grep -o "$STORAGE_DESTINO:vm-$CURRENT_VMID-disk-[0-9]*" /tmp/imp_${CURRENT_VMID}.log | head -n 1)
+            if [ -n "$VOL" ]; then
+                qm set $CURRENT_VMID --$bus "$VOL"
+                [ "$bus" == "scsi0" ] && qm set $CURRENT_VMID --boot "order=$bus"
+            else
+                log_msg "    [x] Falha ao importar disco $vmdk_name!"
+                EXIT_CODE=1
+            fi
+        done
+
+        # Parse Redes
+        IFS=' ' read -r -a VLAN_ARRAY <<< "${MAPA_VLANS[$num_vm]}"
+        net_idx=0
+        grep -i 'ethernet[0-9]*\.present.*TRUE' "$caminho_vm" | while read -r eth_line; do
+            eth_prefix=$(echo "$eth_line" | cut -d'.' -f1) # ex: ethernet0
+            mac=$(grep -i "^${eth_prefix}.generatedAddress" "$caminho_vm" | cut -d'"' -f2)
+            [ -z "$mac" ] && mac=$(grep -i "^${eth_prefix}.address " "$caminho_vm" | cut -d'"' -f2)
+            
+            NET_CONFIG="virtio,bridge=vmbr0"
+            [ -n "$mac" ] && NET_CONFIG="virtio=${mac},bridge=vmbr0"
+            [ -n "${VLAN_ARRAY[$net_idx]}" ] && NET_CONFIG="$NET_CONFIG,tag=${VLAN_ARRAY[$net_idx]}"
+            
+            qm set $CURRENT_VMID --net${net_idx} "$NET_CONFIG"
+            ((net_idx++))
+        done
+    fi
+
+    # AÇÕES PÓS-IMPORTAÇÃO (Todos os modos)
+    if [ $EXIT_CODE -eq 0 ]; then
         if [ "$OPT_INJECT" == "1" ]; then
-            DRIVES_CD=$(qm config $CURRENT_VMID | grep 'media=cdrom' | awk -F: '{print $1}')
-            for drive in $DRIVES_CD; do
-                qm set $CURRENT_VMID --delete "$drive"
-            done
+            for drive in $(qm config $CURRENT_VMID | grep 'media=cdrom' | awk -F: '{print $1}'); do qm set $CURRENT_VMID --delete "$drive"; done
             qm set $CURRENT_VMID --ide2 local:iso/pos_install_esxi.iso,media=cdrom
         fi
         
-        # RELIGAR NO ESXI (Agora individualmente por VM)
         if [ "${MAPA_RELIGAR[$num_vm]}" == "1" ] && [ "$SSH_VALIDO" == "1" ]; then
-            log_msg "[*] Localizando $ARQUIVO_VMX no ESXi de origem para religar..."
-            ESXI_VMID=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/getallvms" | grep "$ARQUIVO_VMX" | awk '{print $1}' | head -n 1)
-            
-            if [ -n "$ESXI_VMID" ]; then
-                ESTADO_ANTES=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.getstate $ESXI_VMID" | grep -i 'Powered')
-                log_msg "    -> Estado atual no ESXi (ID $ESXI_VMID): $ESTADO_ANTES"
-                
-                if echo "$ESTADO_ANTES" | grep -qi "Powered off"; then
-                    log_msg "    -> Enviando comando de Power ON no ESXi..."
-                    sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.on $ESXI_VMID" > /dev/null
-                    sleep 3
-                    ESTADO_DEPOIS=$(sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.getstate $ESXI_VMID" | grep -i 'Powered')
-                    log_msg "    -> Novo estado no ESXi: $ESTADO_DEPOIS"
-                else
-                    log_msg "    -> A VM já está ligada no ESXi. Nenhuma ação extra."
-                fi
-            else
-                log_msg "[x] ERRO: Arquivo $ARQUIVO_VMX não encontrado na lista de VMs do ESXi."
-            fi
+            log_msg "    -> Relocando Power ON no ESXi..."
+            sshpass -p "$ESXI_PASS" ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.on $ESXI_VMID" > /dev/null
         fi
 
         if [ "$OPT_START" == "1" ]; then
-            log_msg "[*] Ligando a VM $CURRENT_VMID no Proxmox..."
+            log_msg "    [*] Ligando a VM $CURRENT_VMID no Proxmox..."
             qm start $CURRENT_VMID
         fi
-        
-        log_msg "[v] Concluído: $nome_limpo."
+        log_msg "[v] Concluído com sucesso!"
     else
-        log_msg "[x] ERRO na importação (Código: $EXIT_CODE)."
+        log_msg "[x] ERRO na importação da VM."
     fi
     
-    CURRENT_VMID=""
-    IMPORT_PID=""
     sleep 2
 done
 
+# Limpeza Final
+if [ "$MODO_IMPORT" == "2" ]; then umount -f /mnt/esxi_sshfs &>/dev/null; fi
 log_msg "======================================================"
-log_msg "Lote finalizado com sucesso! Script V13 concluído."
+log_msg "Lote V14 finalizado com sucesso!"
