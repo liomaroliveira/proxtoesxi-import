@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Script de Importação Automática ESXi -> Proxmox V10 (CPU Host & Multi-NIC)
+# Script de Importação Automática ESXi -> Proxmox V11 (CPU Host & Multi-NIC)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -15,7 +15,7 @@ log_msg() {
 }
 
 log_msg "======================================================"
-log_msg "Iniciando sistema de importação V10 (CPU Host)."
+log_msg "Iniciando sistema de importação V11."
 log_msg "Log principal: $LOG_FILE"
 log_msg "======================================================"
 
@@ -55,7 +55,7 @@ processar_saida() {
 # ================= SELETORES DE AUTOMAÇÃO =================
 echo -e "\n=== OPÇÕES DE PÓS-IMPORTAÇÃO ==="
 read -p "Deseja informar VLANs para as VMs? [1] Sim / [2] Não: " OPT_VLAN
-read -p "Aplicar mutação cirúrgica de Hardware (Mantendo originais)? [1] Sim / [2] Não: " OPT_HW
+read -p "Aplicar mutação cirúrgica de Hardware (CPU Host, etc)? [1] Sim / [2] Não: " OPT_HW
 read -p "Disponibilizar script pós-instalação via CD-ROM virtual? [1] Sim / [2] Não: " OPT_INJECT
 read -p "Ligar as VMs automaticamente após a importação? [1] Sim / [2] Não: " OPT_START
 
@@ -172,7 +172,8 @@ log_msg "Iniciando fila..."
 
 for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
     caminho_vm="${MAPA_VMS[$num_vm]}"
-    CURRENT_VMID=$(pvesh get /cluster/nextid)
+    CURRENT_VMID=$(presh get /cluster/nextid) # fallback se pvesh falhar
+    CURRENT_VMID=$(pvesh get /cluster/nextid 2>/dev/null || pvesh get /cluster/nextid)
     nome_limpo=$(echo "$caminho_vm" | awk -F'/' '{print $2 " / " $NF}')
     
     log_msg "------------------------------------------------------"
@@ -195,7 +196,7 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
             
             DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata|virtio)[0-9]+:' | grep -v 'cdrom' | head -n 1 | awk -F: '{print $1}')
             
-            # --- ATUALIZAÇÃO V10: INSERIDO --cpu host ---
+            # --- MUTAÇÃO BASE COM CPU HOST INJETADA ---
             qm set $CURRENT_VMID --sockets 1 --cores $TOTAL_CORES --cpu host --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
             
             if [ -n "$DISCO_BOOT" ]; then
@@ -222,7 +223,7 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
                 fi
                 
                 qm set $CURRENT_VMID --$placa "$NEW_NET"
-                log_msg "    -> Placa $placa convertida. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
+                log_msg "    -> Placa $placa convertida para VirtIO. MAC: $MAC | VLAN: ${VLAN_ARRAY[$idx]:-Nenhuma}"
             done
         fi
         
@@ -250,4 +251,4 @@ for num_vm in "${VMS_PARA_IMPORTAR[@]}"; do
 done
 
 log_msg "======================================================"
-log_msg "Lote finalizado com sucesso! Script V10 concluído."
+log_msg "Lote finalizado com sucesso! Script V11 concluído."
