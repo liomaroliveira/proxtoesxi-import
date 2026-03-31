@@ -1,13 +1,17 @@
 #!/bin/bash
 
 # ==========================================
-# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V16)
+# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V17)
 # ==========================================
+
+LOG_FILE="/var/log/migracao_esxi_proxmox.log"
+log_w() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] [WIZARD] $1" | tee -a "$LOG_FILE"; }
 
 clear
 echo "======================================================"
 echo "WIZARD DE AGENDAMENTO DE MIGRAÇÃO ESXi -> PROXMOX"
 echo "======================================================"
+log_w "Iniciando Wizard de Agendamento V17..."
 
 # --- 1. CONFIGURAÇÕES GLOBAIS ---
 echo -e "\n=== MODO DE IMPORTAÇÃO ==="
@@ -15,12 +19,14 @@ echo "[1] Via Storage Plugin Proxmox (Padrão)"
 echo "[2] Via SSHFS (Monta o ESXi remoto)"
 echo "[3] Via USB/Armazenamento Local (Para backups offline)"
 read -p "Escolha [1-3]: " MODO_IMPORT
+log_w "Modo de Importação selecionado: $MODO_IMPORT"
 
 echo -e "\n=== DESTINO ==="
 mapfile -t DEST_STORAGES < <(pvesm status | awk 'NR>1 && $4>0 {print $1}')
 for i in "${!DEST_STORAGES[@]}"; do echo "[$((i+1))] ${DEST_STORAGES[$i]}"; done
 read -p "Número do storage de Destino: " n_dest
 STORAGE_DESTINO="${DEST_STORAGES[$((n_dest-1))]}"
+log_w "Storage de Destino selecionado: $STORAGE_DESTINO"
 
 echo -e "\n=== OPÇÕES DE AUTOMAÇÃO ==="
 read -p "Injetar ISO pós-instalação (Rede/Agent)? [1] Sim / [0] Não: " OPT_INJECT
@@ -37,11 +43,13 @@ USB_PATH=""
 
 if [ "$MODO_IMPORT" == "1" ] || [ "$MODO_IMPORT" == "2" ] || [ "$OPT_PREFLIGHT" == "1" ] || [ "$OPT_RELIGAR" == "1" ]; then
     read -p "IP do host ESXi de origem: " ESXI_HOST
-    # Valida SSH sem senha
+    log_w "Testando conexao SSH sem senha com $ESXI_HOST..."
     if ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$ESXI_USER@$ESXI_HOST" "echo OK" &>/dev/null; then
+        log_w "ERRO: Conexao SSH sem senha falhou."
         echo "[!] ERRO: Conexão SSH sem senha falhou. Configure as chaves RSA antes de agendar."
         exit 1
     fi
+    log_w "Conexao SSH validada com sucesso."
 fi
 
 declare -A MAPA_VMS
@@ -50,10 +58,12 @@ if [ "$MODO_IMPORT" == "1" ]; then
     for i in "${!ESXI_STORAGES[@]}"; do echo "[$((i+1))] ${ESXI_STORAGES[$i]}"; done
     read -p "Número do storage Origem ESXi: " n_origem
     STORAGE_ORIGEM="${ESXI_STORAGES[$((n_origem-1))]}"
+    log_w "Storage de Origem selecionado: $STORAGE_ORIGEM"
     mapfile -t VMS_BRUTAS < <(pvesm list "$STORAGE_ORIGEM" | awk 'NR>1 {print $1}' | grep "\.vmx$")
 
 elif [ "$MODO_IMPORT" == "2" ]; then
     read -p "Digite o NOME do Datastore no ESXi (ex: datastore1): " DS_NOME
+    log_w "Mapeando Datastore $DS_NOME via SSHFS..."
     mkdir -p /mnt/esxi_sshfs
     sshfs "$ESXI_USER@$ESXI_HOST:/vmfs/volumes" /mnt/esxi_sshfs -o StrictHostKeyChecking=no,allow_other,IdentityFile=~/.ssh/id_rsa
     mapfile -t VMS_BRUTAS < <(find /mnt/esxi_sshfs/$DS_NOME -maxdepth 2 -name "*.vmx")
@@ -61,11 +71,16 @@ elif [ "$MODO_IMPORT" == "2" ]; then
 
 elif [ "$MODO_IMPORT" == "3" ]; then
     read -p "Digite o caminho ABSOLUTO do diretório USB (ex: /mnt/hdd_bkp/VM_UNIFI_BACKUP): " USB_PATH
+    log_w "Mapeando VMs locais em $USB_PATH..."
     mapfile -t VMS_BRUTAS < <(find "$USB_PATH" -maxdepth 2 -name "*.vmx")
 fi
 
 for i in "${!VMS_BRUTAS[@]}"; do MAPA_VMS[$((i+1))]="${VMS_BRUTAS[$i]}"; done
-if [ ${#MAPA_VMS[@]} -eq 0 ]; then echo "[x] Nenhuma VM encontrada na origem. Abortando."; exit 1; fi
+if [ ${#MAPA_VMS[@]} -eq 0 ]; then
+    log_w "ERRO: Nenhuma VM encontrada na origem."
+    echo "[x] Nenhuma VM encontrada na origem. Abortando."
+    exit 1
+fi
 
 # --- 3. SELEÇÃO E VLANs ---
 echo -e "\n=== VMS ENCONTRADAS ==="
@@ -83,20 +98,26 @@ else
     for num in $ESCOLHA_USER; do
         ARQ_VMX=$(basename "${MAPA_VMS[$num]}")
         read -p "VLANs para $ARQ_VMX (separadas por espaço, ou Enter p/ sem VLAN): " vlan_input
-        ARRAY_VMS_CODE+="\n    \"$ARQ_VMX|$vlan_input\""
+        # Correção Sintática: Adiciona quebra de linha real na variável
+        ARRAY_VMS_CODE="${ARRAY_VMS_CODE}
+    \"${ARQ_VMX}|${vlan_input}\""
+        log_w "VM agendada: $ARQ_VMX | VLANs: ${vlan_input:-Nenhuma}"
     done
 fi
 
 # --- 4. GERAÇÃO DO SCRIPT AUTÔNOMO ---
 SCRIPT_DESTINO="/root/executa_migracao_agendada.sh"
 echo "[*] Gerando o script autônomo em $SCRIPT_DESTINO..."
+log_w "Gerando script motor autônomo..."
 
 # Grava as variáveis expandidas no topo do novo script
 cat << EOF > "$SCRIPT_DESTINO"
 #!/bin/bash
 # ==========================================
-# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V16
+# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V17
 # ==========================================
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 MODO_IMPORT="$MODO_IMPORT"
 STORAGE_DESTINO="$STORAGE_DESTINO"
 OPT_INJECT="$OPT_INJECT"
@@ -125,7 +146,7 @@ ISO_SCRIPT_PATH="/var/lib/vz/template/iso/pos_install_esxi.iso"
 log_msg() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
 
 log_msg "======================================================"
-log_msg "INICIANDO MIGRAÇÃO AUTÔNOMA V16 (Modo $MODO_IMPORT)"
+log_msg "INICIANDO MIGRAÇÃO AUTÔNOMA V17 (Modo $MODO_IMPORT)"
 log_msg "======================================================"
 
 for pkg in genisoimage sshfs; do
@@ -317,6 +338,7 @@ EOF
 
 chmod +x "$SCRIPT_DESTINO"
 echo "[v] Script autônomo gerado com sucesso."
+log_w "Script autônomo gravado em $SCRIPT_DESTINO"
 
 # --- 5. AGENDAMENTO NO CRONTAB ---
 echo -e "\n=== AGENDAMENTO CRON ==="
@@ -325,15 +347,15 @@ if [ "$OPT_CRON" == "1" ]; then
     read -p "Hora de execução (0-23): " CRON_H
     read -p "Minuto de execução (0-59): " CRON_M
     
-    # Remove qualquer agendamento anterior do nosso script para evitar duplicidade
     crontab -l 2>/dev/null | grep -v "$SCRIPT_DESTINO" > /tmp/crontmp
-    # Adiciona a nova linha
     echo "$CRON_M $CRON_H * * * $SCRIPT_DESTINO > /dev/null 2>&1" >> /tmp/crontmp
     crontab /tmp/crontmp
     rm /tmp/crontmp
     
     echo "[v] Agendamento criado! A migração rodará às $CRON_H:$CRON_M."
     echo "[*] Para monitorar os logs na hora agendada: tail -f /var/log/migracao_esxi_proxmox.log"
+    log_w "Agendamento confirmado no Crontab para as $CRON_H:$CRON_M"
 else
     echo "[*] Agendamento pulado. Para rodar manualmente depois, digite: $SCRIPT_DESTINO"
+    log_w "Agendamento ignorado pelo usuario."
 fi
