@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V17)
+# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V18)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -11,7 +11,7 @@ clear
 echo "======================================================"
 echo "WIZARD DE AGENDAMENTO DE MIGRAÇÃO ESXi -> PROXMOX"
 echo "======================================================"
-log_w "Iniciando Wizard de Agendamento V17..."
+log_w "Iniciando Wizard de Agendamento V18..."
 
 # --- 1. CONFIGURAÇÕES GLOBAIS ---
 echo -e "\n=== MODO DE IMPORTAÇÃO ==="
@@ -98,7 +98,6 @@ else
     for num in $ESCOLHA_USER; do
         ARQ_VMX=$(basename "${MAPA_VMS[$num]}")
         read -p "VLANs para $ARQ_VMX (separadas por espaço, ou Enter p/ sem VLAN): " vlan_input
-        # Correção Sintática: Adiciona quebra de linha real na variável
         ARRAY_VMS_CODE="${ARRAY_VMS_CODE}
     \"${ARQ_VMX}|${vlan_input}\""
         log_w "VM agendada: $ARQ_VMX | VLANs: ${vlan_input:-Nenhuma}"
@@ -110,11 +109,10 @@ SCRIPT_DESTINO="/root/executa_migracao_agendada.sh"
 echo "[*] Gerando o script autônomo em $SCRIPT_DESTINO..."
 log_w "Gerando script motor autônomo..."
 
-# Grava as variáveis expandidas no topo do novo script
 cat << EOF > "$SCRIPT_DESTINO"
 #!/bin/bash
 # ==========================================
-# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V17
+# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V18
 # ==========================================
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -135,7 +133,6 @@ VMS_TARGET=( $ARRAY_VMS_CODE
 
 EOF
 
-# Grava o motor (sem expandir variáveis do Bash local)
 cat << 'EOF' >> "$SCRIPT_DESTINO"
 # ================= INÍCIO DO MOTOR =================
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -146,7 +143,7 @@ ISO_SCRIPT_PATH="/var/lib/vz/template/iso/pos_install_esxi.iso"
 log_msg() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
 
 log_msg "======================================================"
-log_msg "INICIANDO MIGRAÇÃO AUTÔNOMA V17 (Modo $MODO_IMPORT)"
+log_msg "INICIANDO MIGRAÇÃO AUTÔNOMA V18 (Modo $MODO_IMPORT)"
 log_msg "======================================================"
 
 for pkg in genisoimage sshfs; do
@@ -251,22 +248,38 @@ for info in "${TARGETS_FINAL[@]}"; do
     log_msg "Processando: $NOME_LIMPO -> ID Proxmox $CURRENT_VMID"
 
     if [ "$OPT_PREFLIGHT" == "1" ] && [[ "$MODO_IMPORT" == "1" || "$MODO_IMPORT" == "2" ]]; then
+        log_msg "    [Pre-Flight] Buscando ID da VM no ESXi de origem..."
         ESXI_VMID=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/getallvms" | grep "$ARQ_VMX" | awk '{print $1}' | head -n 1)
         if [ -n "$ESXI_VMID" ]; then
+            log_msg "    [Pre-Flight] Checando estado de energia..."
             if ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.getstate $ESXI_VMID" | grep -qi 'Powered on'; then
+                log_msg "    [Pre-Flight] Desligando VM no ESXi..."
                 ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.off $ESXI_VMID" > /dev/null
                 sleep 5
             fi
+            
+            # TRUQUE DA CONSOLIDAÇÃO FORÇADA (Dummy Snapshot -> RemoveAll)
+            log_msg "    [Pre-Flight] Forcando consolidacao de discos orfaos..."
+            ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/snapshot.create $ESXI_VMID 'Migracao-Proxmox' 'Forced-Consolidation' 0 0" > /dev/null
             ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/snapshot.removeall $ESXI_VMID" > /dev/null
-            while ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vimsvc/task_list" | grep -qi "removeAllSnapshots"; do sleep 5; done
+            
+            log_msg "    [Pre-Flight] Aguardando conclusao das tarefas em background no VMware..."
+            while ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/get.tasklist $ESXI_VMID" | grep -q "vim.Task"; do 
+                sleep 5
+            done
+            log_msg "    [Pre-Flight] Pre-Flight concluido com sucesso!"
+        else
+            log_msg "    [Pre-Flight] AVISO: VM nao encontrada via API do VMware. Pulando validacao de discos."
         fi
     fi
 
     if [ "$MODO_IMPORT" == "1" ]; then
+        log_msg "    -> Disparando o importador nativo do Proxmox (Isso pode demorar a exibir progresso se o disco for grande)..."
         qm import $CURRENT_VMID "$caminho_vm" --storage "$STORAGE_DESTINO" > >(processar_saida) 2>&1 &
         wait $!
         EXIT_CODE=$?
         if [ $EXIT_CODE -eq 0 ]; then
+            log_msg "    -> Aplicando mutacoes de hardware VirtIO..."
             OLD_CORES=$(qm config $CURRENT_VMID | awk '/^cores:/ {print $2}'); [ -z "$OLD_CORES" ] && OLD_CORES=1
             OLD_SOCKETS=$(qm config $CURRENT_VMID | awk '/^sockets:/ {print $2}'); [ -z "$OLD_SOCKETS" ] && OLD_SOCKETS=1
             qm set $CURRENT_VMID --sockets 1 --cores $((OLD_CORES * OLD_SOCKETS)) --cpu host --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
@@ -285,6 +298,7 @@ for info in "${TARGETS_FINAL[@]}"; do
             done
         fi
     else
+        log_msg "    -> VMX Parser Analítico. Recriando esqueleto da VM..."
         MEM=$(grep -iE '^memSize' "$caminho_vm" | cut -d'"' -f2 | tr -d '\r')
         CORES=$(grep -iE '^numvcpus' "$caminho_vm" | cut -d'"' -f2 | tr -d '\r')
         qm create $CURRENT_VMID --name "$NOME_LIMPO" --memory "${MEM:-2048}" --sockets 1 --cores "${CORES:-1}" --cpu host --scsihw virtio-scsi-single --vga virtio --agent 1 --onboot 1
@@ -295,6 +309,8 @@ for info in "${TARGETS_FINAL[@]}"; do
             bus=$(echo "$dev" | cut -d':' -f1)
             vmdk_name=$(echo "$line" | cut -d'"' -f2 | tr -d '\r')
             vmdk_path="$(dirname "$caminho_vm")/$vmdk_name"
+            
+            log_msg "    -> Injetando disco $vmdk_name no barramento $bus (Aguarde o processamento)..."
             qm importdisk $CURRENT_VMID "$vmdk_path" "$STORAGE_DESTINO" --format raw > /tmp/imp_${CURRENT_VMID}.log 2>&1
             VOL=$(grep -o "$STORAGE_DESTINO:vm-$CURRENT_VMID-disk-[0-9]*" /tmp/imp_${CURRENT_VMID}.log | head -n 1)
             if [ -n "$VOL" ]; then
@@ -321,19 +337,26 @@ for info in "${TARGETS_FINAL[@]}"; do
 
     if [ $EXIT_CODE -eq 0 ]; then
         if [ "$OPT_INJECT" == "1" ]; then
+            log_msg "    -> Acoplando ISO do script de Post-Install..."
             for drive in $(qm config $CURRENT_VMID | grep 'media=cdrom' | awk -F: '{print $1}'); do qm set $CURRENT_VMID --delete "$drive"; done
             qm set $CURRENT_VMID --ide2 local:iso/pos_install_esxi.iso,media=cdrom
         fi
-        if [ "$OPT_RELIGAR" == "1" ]; then ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.on $ESXI_VMID" > /dev/null; fi
-        if [ "$OPT_START" == "1" ]; then qm start $CURRENT_VMID; fi
-        log_msg "[v] Concluído com sucesso!"
+        if [ "$OPT_RELIGAR" == "1" ]; then 
+            log_msg "    -> Relocando Power ON na VM original do ESXi..."
+            ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.on $ESXI_VMID" > /dev/null
+        fi
+        if [ "$OPT_START" == "1" ]; then 
+            log_msg "    [*] Inicializando VM no Proxmox..."
+            qm start $CURRENT_VMID
+        fi
+        log_msg "[v] VM $NOME_LIMPO concluída com sucesso!"
     else
-        log_msg "[x] ERRO na importação da VM."
+        log_msg "[x] ERRO: Falha crítica na importação da VM $NOME_LIMPO."
     fi
     sleep 2
 done
 if [ "$MODO_IMPORT" == "2" ]; then umount -f /mnt/esxi_sshfs &>/dev/null; fi
-log_msg "Lote finalizado!"
+log_msg "Lote finalizado com sucesso!"
 EOF
 
 chmod +x "$SCRIPT_DESTINO"
