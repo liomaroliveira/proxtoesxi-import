@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V20)
+# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V21)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -30,7 +30,6 @@ if [ ${#EXISTING_JOBS[@]} -gt 0 ]; then
             log_w "Todos os agendamentos previos foram apagados pelo usuario."
         elif [[ "$REMOVE_OPT" =~ ^[0-9]+$ ]] && [ "$REMOVE_OPT" -le "${#EXISTING_JOBS[@]}" ]; then
             JOB_TO_REMOVE="${EXISTING_JOBS[$((REMOVE_OPT-1))]}"
-            # Escapa caracteres especiais para o grep -v
             ESCAPED_JOB=$(echo "$JOB_TO_REMOVE" | sed 's/[][\.^$*]/\\&/g')
             crontab -l | grep -v "$ESCAPED_JOB" | crontab -
             echo "[v] Agendamento $REMOVE_OPT removido."
@@ -39,7 +38,7 @@ if [ ${#EXISTING_JOBS[@]} -gt 0 ]; then
     fi
 fi
 
-log_w "Iniciando criacao de nova fila V20..."
+log_w "Iniciando criacao de nova fila V21..."
 
 # --- 1. CONFIGURAÇÕES GLOBAIS ---
 echo -e "\n=== MODO DE IMPORTAÇÃO ==="
@@ -70,10 +69,16 @@ USB_PATH=""
 
 if [ "$MODO_IMPORT" == "1" ] || [ "$MODO_IMPORT" == "2" ] || [ "$OPT_PREFLIGHT" == "1" ] || [ "$OPT_RELIGAR" == "1" ]; then
     read -p "IP do host ESXi de origem: " ESXI_HOST
+    echo "[*] Testando conexão SSH sem senha com $ESXI_HOST..."
+    log_w "Testando conexao SSH sem senha com $ESXI_HOST..."
+    
     if ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$ESXI_USER@$ESXI_HOST" "echo OK" &>/dev/null; then
         echo "[!] ERRO: Conexão SSH sem senha falhou. Configure as chaves RSA."
+        log_w "ERRO: Conexao SSH falhou."
         exit 1
     fi
+    echo "[v] Conexão SSH validada com sucesso."
+    log_w "Conexao SSH validada com sucesso."
 fi
 
 declare -A MAPA_VMS
@@ -120,7 +125,7 @@ else
     done
 fi
 
-# --- 4. CONFIGURAÇÃO DE TEMPO (CRONOLOGIA V20) ---
+# --- 4. CONFIGURAÇÃO DE TEMPO (CRONOLOGIA) ---
 echo -e "\n=== AGENDAMENTO CRON AVANÇADO ==="
 read -p "Deseja agendar a execução agora? [1] Sim / [0] Não: " OPT_CRON
 
@@ -159,7 +164,7 @@ echo -e "\n[*] Gerando o script autônomo incremental em $SCRIPT_DESTINO..."
 cat << EOF > "$SCRIPT_DESTINO"
 #!/bin/bash
 # ==========================================
-# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V20
+# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V21
 # ==========================================
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
