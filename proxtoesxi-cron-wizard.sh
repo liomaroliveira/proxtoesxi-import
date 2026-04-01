@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V21)
+# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V22)
 # ==========================================
 
 LOG_FILE="/var/log/migracao_esxi_proxmox.log"
@@ -38,7 +38,7 @@ if [ ${#EXISTING_JOBS[@]} -gt 0 ]; then
     fi
 fi
 
-log_w "Iniciando criacao de nova fila V21..."
+log_w "Iniciando criacao de nova fila V22..."
 
 # --- 1. CONFIGURAÇÕES GLOBAIS ---
 echo -e "\n=== MODO DE IMPORTAÇÃO ==="
@@ -90,10 +90,28 @@ if [ "$MODO_IMPORT" == "1" ]; then
     mapfile -t VMS_BRUTAS < <(pvesm list "$STORAGE_ORIGEM" | awk 'NR>1 {print $1}' | grep "\.vmx$")
 
 elif [ "$MODO_IMPORT" == "2" ]; then
-    read -p "Nome do Datastore no ESXi (ex: datastore1): " DS_NOME
+    echo -e "\n[*] Buscando Datastores disponíveis no ESXi via SSH..."
+    # Lista datastores ignorando UUIDs puros (começam com 8 caracteres hexadecimais)
+    mapfile -t ESXI_DATASTORES < <(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "ls -1 /vmfs/volumes | grep -vE '^[0-9a-fA-F]{8}-'")
+    
+    if [ ${#ESXI_DATASTORES[@]} -eq 0 ]; then
+        echo "[x] Nenhum Datastore encontrado no host remoto. Abortando."
+        exit 1
+    fi
+    
+    for i in "${!ESXI_DATASTORES[@]}"; do echo "[$((i+1))] ${ESXI_DATASTORES[$i]}"; done
+    read -p "Número do Datastore Origem ESXi: " n_ds_origem
+    DS_NOME="${ESXI_DATASTORES[$((n_ds_origem-1))]}"
+    
+    echo "[*] Mapeando VMs no datastore $DS_NOME..."
     mkdir -p /mnt/esxi_sshfs
-    sshfs "$ESXI_USER@$ESXI_HOST:/vmfs/volumes" /mnt/esxi_sshfs -o StrictHostKeyChecking=no,allow_other,IdentityFile=~/.ssh/id_rsa
-    mapfile -t VMS_BRUTAS < <(find /mnt/esxi_sshfs/$DS_NOME -maxdepth 2 -name "*.vmx")
+    if ! command -v sshfs &> /dev/null; then apt-get update >/dev/null && apt-get install sshfs -y >/dev/null; fi
+    
+    # Resolve o symlink remoto antes de montar para evitar erro local de diretório não encontrado
+    REAL_PATH=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "readlink -f /vmfs/volumes/$DS_NOME")
+    sshfs "$ESXI_USER@$ESXI_HOST:$REAL_PATH" /mnt/esxi_sshfs -o StrictHostKeyChecking=no,allow_other,IdentityFile=~/.ssh/id_rsa
+    
+    mapfile -t VMS_BRUTAS < <(find /mnt/esxi_sshfs -maxdepth 2 -name "*.vmx")
     umount -f /mnt/esxi_sshfs &>/dev/null
 
 elif [ "$MODO_IMPORT" == "3" ]; then
@@ -103,7 +121,7 @@ fi
 
 for i in "${!VMS_BRUTAS[@]}"; do MAPA_VMS[$((i+1))]="${VMS_BRUTAS[$i]}"; done
 if [ ${#MAPA_VMS[@]} -eq 0 ]; then
-    echo "[x] Nenhuma VM encontrada. Abortando."
+    echo "[x] Nenhuma VM encontrada no armazenamento selecionado. Abortando."
     exit 1
 fi
 
@@ -164,7 +182,7 @@ echo -e "\n[*] Gerando o script autônomo incremental em $SCRIPT_DESTINO..."
 cat << EOF > "$SCRIPT_DESTINO"
 #!/bin/bash
 # ==========================================
-# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V21
+# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V22
 # ==========================================
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -261,8 +279,9 @@ if [ "$MODO_IMPORT" == "1" ]; then
 elif [ "$MODO_IMPORT" == "2" ]; then
     if ! command -v sshfs &> /dev/null; then apt-get update >/dev/null && apt-get install sshfs -y >/dev/null; fi
     mkdir -p /mnt/esxi_sshfs
-    sshfs "$ESXI_USER@$ESXI_HOST:/vmfs/volumes" /mnt/esxi_sshfs -o StrictHostKeyChecking=no,allow_other,IdentityFile=~/.ssh/id_rsa
-    mapfile -t VMS_BRUTAS < <(find /mnt/esxi_sshfs/$DS_NOME -maxdepth 2 -name "*.vmx")
+    REAL_PATH=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "readlink -f /vmfs/volumes/$DS_NOME")
+    sshfs "$ESXI_USER@$ESXI_HOST:$REAL_PATH" /mnt/esxi_sshfs -o StrictHostKeyChecking=no,allow_other,IdentityFile=~/.ssh/id_rsa
+    mapfile -t VMS_BRUTAS < <(find /mnt/esxi_sshfs -maxdepth 2 -name "*.vmx")
 elif [ "$MODO_IMPORT" == "3" ]; then
     mapfile -t VMS_BRUTAS < <(find "$USB_PATH" -maxdepth 2 -name "*.vmx")
 fi
