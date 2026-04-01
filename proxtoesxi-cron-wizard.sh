@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # ==========================================
-# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V22)
+# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V23)
 # ==========================================
 
-LOG_FILE="/var/log/migracao_esxi_proxmox.log"
-log_w() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] [WIZARD] $1" | tee -a "$LOG_FILE"; }
+WIZARD_LOG="/var/log/migracao_esxi_proxmox.log"
+log_w() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] [WIZARD] $1" | tee -a "$WIZARD_LOG"; }
 
 clear
 echo "======================================================"
@@ -38,7 +38,7 @@ if [ ${#EXISTING_JOBS[@]} -gt 0 ]; then
     fi
 fi
 
-log_w "Iniciando criacao de nova fila V22..."
+log_w "Iniciando criacao de nova fila V23..."
 
 # --- 1. CONFIGURAÇÕES GLOBAIS ---
 echo -e "\n=== MODO DE IMPORTAÇÃO ==="
@@ -91,7 +91,6 @@ if [ "$MODO_IMPORT" == "1" ]; then
 
 elif [ "$MODO_IMPORT" == "2" ]; then
     echo -e "\n[*] Buscando Datastores disponíveis no ESXi via SSH..."
-    # Lista datastores ignorando UUIDs puros (começam com 8 caracteres hexadecimais)
     mapfile -t ESXI_DATASTORES < <(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "ls -1 /vmfs/volumes | grep -vE '^[0-9a-fA-F]{8}-'")
     
     if [ ${#ESXI_DATASTORES[@]} -eq 0 ]; then
@@ -107,7 +106,6 @@ elif [ "$MODO_IMPORT" == "2" ]; then
     mkdir -p /mnt/esxi_sshfs
     if ! command -v sshfs &> /dev/null; then apt-get update >/dev/null && apt-get install sshfs -y >/dev/null; fi
     
-    # Resolve o symlink remoto antes de montar para evitar erro local de diretório não encontrado
     REAL_PATH=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "readlink -f /vmfs/volumes/$DS_NOME")
     sshfs "$ESXI_USER@$ESXI_HOST:$REAL_PATH" /mnt/esxi_sshfs -o StrictHostKeyChecking=no,allow_other,IdentityFile=~/.ssh/id_rsa
     
@@ -174,19 +172,22 @@ if [ "$OPT_CRON" == "1" ]; then
     fi
 fi
 
-# --- 5. GERAÇÃO DO SCRIPT AUTÔNOMO (INCREMENTAL) ---
+# --- 5. GERAÇÃO DO SCRIPT AUTÔNOMO E LOG ISOLADO ---
 UNIQUE_ID=$(date +'%Y%m%d_%H%M%S')
 SCRIPT_DESTINO="/root/executa_migracao_${UNIQUE_ID}.sh"
+EXEC_LOG="/var/log/migracao_exec_${UNIQUE_ID}.log"
+
 echo -e "\n[*] Gerando o script autônomo incremental em $SCRIPT_DESTINO..."
 
 cat << EOF > "$SCRIPT_DESTINO"
 #!/bin/bash
 # ==========================================
-# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V22
+# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V23
 # ==========================================
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 MY_SCRIPT_PATH="$SCRIPT_DESTINO"
+MY_EXEC_LOG="$EXEC_LOG"
 IS_RECURRING="$IS_RECURRING"
 
 MODO_IMPORT="$MODO_IMPORT"
@@ -208,12 +209,11 @@ EOF
 
 cat << 'EOF' >> "$SCRIPT_DESTINO"
 # ================= INÍCIO DO MOTOR =================
-LOG_FILE="/var/log/migracao_esxi_proxmox.log"
 CURRENT_VMID=""
 IMPORT_PID=""
 ISO_SCRIPT_PATH="/var/lib/vz/template/iso/pos_install_esxi.iso"
 
-log_msg() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+log_msg() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$MY_EXEC_LOG"; }
 
 log_msg "======================================================"
 log_msg "INICIANDO FILA DE MIGRAÇÃO: $MY_SCRIPT_PATH"
@@ -222,7 +222,7 @@ log_msg "======================================================"
 cleanup() {
     log_msg "\n[!] AVISO: INTERRUPÇÃO DETECTADA!"
     if [ -n "$IMPORT_PID" ]; then kill -9 $IMPORT_PID 2>/dev/null; fi
-    if [ -n "$CURRENT_VMID" ]; then qm destroy $CURRENT_VMID --purge 1 >> "$LOG_FILE" 2>&1; fi
+    if [ -n "$CURRENT_VMID" ]; then qm destroy $CURRENT_VMID --purge 1 >> "$MY_EXEC_LOG" 2>&1; fi
     umount -f /mnt/esxi_sshfs &>/dev/null
     exit 1
 }
@@ -235,7 +235,7 @@ processar_saida() {
             echo -en "\r[$(date +'%H:%M:%S')] $line\033[K"
             last_trans="$line"; prev_was_trans=1
         else
-            if [[ $prev_was_trans -eq 1 ]]; then echo ""; echo "[$(date +'%H:%M:%S')] $last_trans" >> "$LOG_FILE"; prev_was_trans=0; fi
+            if [[ $prev_was_trans -eq 1 ]]; then echo ""; echo "[$(date +'%H:%M:%S')] $last_trans" >> "$MY_EXEC_LOG"; prev_was_trans=0; fi
             log_msg "$line"
         fi
     done
@@ -437,6 +437,14 @@ if [ "$OPT_CRON" == "1" ]; then
     
     DATA_NOME="${CRON_D}/${CRON_MON}"
     [ "$TIPO_DATA" == "4" ] && DATA_NOME="Diario"
-    echo "[v] Agendado para: $DATA_NOME as $CRON_H:$CRON_M."
+    echo -e "\n======================================================"
+    echo "[v] AGENDAMENTO CRIADO COM SUCESSO"
+    echo "    Data: $DATA_NOME às $CRON_H:$CRON_M"
+    echo "    Script Gerado: $SCRIPT_DESTINO"
+    echo "======================================================"
+    echo ">>> PARA MONITORAR A EXECUÇÃO EM TEMPO REAL NO HORÁRIO AGENDADO, RODE O COMANDO ABAIXO:"
+    echo "tail -f $EXEC_LOG"
+    echo "======================================================"
+    
     log_w "Novo script engatilhado no cron: $SCRIPT_DESTINO (Data: $DATA_NOME $CRON_H:$CRON_M)"
 fi
