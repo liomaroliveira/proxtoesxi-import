@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Proxmox VM Exporter & Migrator - V4
+# Proxmox VM Exporter & Migrator - V5
 # ==============================================================================
 
 # ==============================================================================
@@ -184,7 +184,6 @@ get_local_storage_for_backup() {
     if [[ -z "$sel_data" ]]; then handle_interrupt; fi
     LOCAL_STORAGE_NAME=$(echo "$sel_data" | cut -d'|' -f1)
     log "Selecionado: $LOCAL_STORAGE_NAME"
-    log "Info: O arquivo será salvo por padrão em /mnt/pve/$LOCAL_STORAGE_NAME/dump/ ou /var/lib/vz/dump/"
 }
 
 get_target_storages() {
@@ -207,7 +206,7 @@ get_target_storages() {
 }
 
 # ==============================================================================
-# Execução Lógica (Backup SCP / Pipe / Cron Gen)
+# Execução Lógica (Backup SCP / Pipe)
 # ==============================================================================
 execute_backup_scp() {
     get_source_vms
@@ -234,7 +233,6 @@ execute_backup_scp() {
         TEMP_BACKUP_FILE=$(grep "creating archive" "$TEMP_DIR/dump.log" | awk -F"'" '{print $2}')
         log "✅ Backup gerado: $TEMP_BACKUP_FILE. Transferindo..."
 
-        # Rastreio de progresso do Rsync salvando a cada ~10% no log e sobrescrevendo na tela
         sshpass -p "$TARGET_PASS" rsync -a --info=progress2 "$TEMP_BACKUP_FILE" ${TARGET_USER}@${TARGET_IP}:/var/lib/vz/dump/ | while read line; do
             echo -ne "$line\r"
             if [[ "$line" =~ (10%|20%|30%|40%|50%|60%|70%|80%|90%|100%) ]]; then
@@ -289,18 +287,86 @@ execute_direct_pipe() {
 }
 
 # ==============================================================================
-# Geração de Agendamento (Cron)
+# Geração de Agendamento Simplificado (Cron)
 # ==============================================================================
 generate_cron_script() {
     local METHOD=$1
     echo "=========================================================="
-    echo " CONFIGURAÇÃO DE AGENDAMENTO"
-    read -p "Minuto (0-59 ou *): " CRON_MIN
-    read -p "Hora (0-23 ou *): " CRON_HR
-    read -p "Dia do Mês (1-31 ou *): " CRON_DOM
-    read -p "Mês (1-12 ou *): " CRON_MON
-    read -p "Dia da Semana (0-7 ou *): " CRON_DOW
-    read -p "Agendamento de uso único? Será excluído após rodar. (s/n): " RUN_ONCE
+    echo " CONFIGURAÇÃO DE AGENDAMENTO SIMPLIFICADA"
+    echo "=========================================================="
+    
+    # Defaults do Cron
+    local CRON_MIN="*"
+    local CRON_HR="*"
+    local CRON_DOM="*"
+    local CRON_MON="*"
+    local CRON_DOW="*"
+    local RUN_ONCE="n"
+    
+    read -p "Digite o horário de execução (HH:MM, ex: 03:30): " EXEC_TIME
+    CRON_HR=$(echo "$EXEC_TIME" | cut -d: -f1)
+    CRON_MIN=$(echo "$EXEC_TIME" | cut -d: -f2)
+    
+    read -p "A execução será recorrente? (s/N) [Padrão: n]: " IS_RECURRING
+    IS_RECURRING=${IS_RECURRING:-n}
+    
+    if [[ "$IS_RECURRING" == "n" || "$IS_RECURRING" == "N" ]]; then
+        RUN_ONCE="s"
+        log "Cron Wizard: Execução ÚNICA selecionada."
+        echo "1) Hoje"
+        echo "2) Amanhã"
+        echo "3) Data Específica"
+        read -p "Selecione o dia da execução: " DIA_OPCAO
+        
+        case $DIA_OPCAO in
+            1) 
+                CRON_DOM=$(date +%d)
+                CRON_MON=$(date +%m)
+                log "Cron Wizard: Execução agendada para HOJE ($CRON_DOM/$CRON_MON) às $EXEC_TIME"
+                ;;
+            2)
+                CRON_DOM=$(date -d "tomorrow" +%d)
+                CRON_MON=$(date -d "tomorrow" +%m)
+                log "Cron Wizard: Execução agendada para AMANHÃ ($CRON_DOM/$CRON_MON) às $EXEC_TIME"
+                ;;
+            3)
+                read -p "Digite a data (DD/MM, ex: 25/12): " EXEC_DATE
+                CRON_DOM=$(echo "$EXEC_DATE" | cut -d/ -f1)
+                CRON_MON=$(echo "$EXEC_DATE" | cut -d/ -f2)
+                log "Cron Wizard: Execução agendada para DATA ESPECÍFICA ($CRON_DOM/$CRON_MON) às $EXEC_TIME"
+                ;;
+            *)
+                echo "Opção inválida."
+                handle_interrupt
+                ;;
+        esac
+    else
+        RUN_ONCE="n"
+        log "Cron Wizard: Execução RECORRENTE selecionada."
+        echo "1) Todos os dias"
+        echo "2) Dias da semana específicos"
+        echo "3) Dias do mês específicos"
+        read -p "Selecione a frequência: " FREQ_OPCAO
+        
+        case $FREQ_OPCAO in
+            1)
+                log "Cron Wizard: Frequência TODOS OS DIAS às $EXEC_TIME"
+                ;;
+            2)
+                echo "0=Dom, 1=Seg, 2=Ter, 3=Qua, 4=Qui, 5=Sex, 6=Sáb"
+                read -p "Digite os números separados por vírgula (ex: 1,3,5 para Seg,Qua,Sex): " CRON_DOW
+                log "Cron Wizard: Frequência DIAS DA SEMANA [$CRON_DOW] às $EXEC_TIME"
+                ;;
+            3)
+                read -p "Digite os dias do mês separados por vírgula (ex: 1,15,30): " CRON_DOM
+                log "Cron Wizard: Frequência DIAS DO MÊS [$CRON_DOM] às $EXEC_TIME"
+                ;;
+            *)
+                echo "Opção inválida."
+                handle_interrupt
+                ;;
+        esac
+    fi
 
     log "Ajustando chaves SSH para execução sem senha..."
     KEY_PATH="$HOME/.ssh/id_ed25519"
@@ -311,6 +377,7 @@ generate_cron_script() {
     JOB_SCRIPT="/usr/local/bin/${JOB_NAME}.sh"
     JOB_LOG="/var/log/${JOB_NAME}.log"
 
+    # Criação do Script Base
     cat << 'EOF' > "$JOB_SCRIPT"
 #!/usr/bin/env bash
 EOF
@@ -321,6 +388,7 @@ EOF
     echo "JOB_LOG=\"$JOB_LOG\"" >> "$JOB_SCRIPT"
     echo "VMS_ARRAY=(${SELECTED_VMS[@]})" >> "$JOB_SCRIPT"
 
+    # Injeção da Lógica de Exportação
     if [[ "$METHOD" == "pipe" ]]; then
         cat << 'EOF' >> "$JOB_SCRIPT"
 log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$JOB_LOG"; }
@@ -353,15 +421,25 @@ done
 EOF
     fi
 
+    # Lógica de Autodestruição para Tarefas de Uso Único
     if [[ "$RUN_ONCE" == "s" || "$RUN_ONCE" == "S" ]]; then
         echo "rm -f /etc/cron.d/${JOB_NAME}" >> "$JOB_SCRIPT"
+        echo "rm -f $JOB_SCRIPT" >> "$JOB_SCRIPT" # O script também se apaga após remover o cron
     fi
 
     chmod +x "$JOB_SCRIPT"
+    
+    # Validação do agendamento (Remove zeros à esquerda soltos do parser humano, pois cron exige '08' ou '8', mas prefere sem zeros para dias do mês)
+    CRON_DOM=$(echo "$CRON_DOM" | sed 's/^0*//')
+    [[ -z "$CRON_DOM" ]] && CRON_DOM="*"
+
     echo "$CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW root $JOB_SCRIPT" > "/etc/cron.d/${JOB_NAME}"
     chmod 644 "/etc/cron.d/${JOB_NAME}"
-    log "✅ Agendamento Salvo: /etc/cron.d/${JOB_NAME}"
     
+    log "✅ Agendamento Salvo: /etc/cron.d/${JOB_NAME}"
+    log "Sintaxe Cron Gerada: $CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW"
+    
+    echo ""
     read -p "Pressione ENTER para voltar ao menu..."
 }
 
