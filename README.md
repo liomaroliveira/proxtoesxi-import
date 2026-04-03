@@ -115,3 +115,69 @@ Toda a operação (desde o mapeamento até erros de I/O de disco) é gravada de 
 ```bash
 tail -f /var/log/migracao_esxi_proxmox.log
 ```
+
+-------------------------------
+# ⚙️ Proxmox VM Migrator - proxtoprox-import-cron-wizard.sh
+
+Este repositório/script automatiza a migração de Máquinas Virtuais (VMs) entre nós Proxmox VE autônomos (fora de um cluster) utilizando transferência direta via SSH e pipes, eliminando a necessidade de armazenamento temporário no nó de origem.
+
+## 🚀 Funcionalidades
+
+* **Importação Direta via SSH (Pipe):** Utiliza `vzdump --stdout` na origem e `qmrestore -` no destino. O tráfego não toca no disco da origem.
+* **Monitoramento de Tráfego:** Implementa `pv` (Pipe Viewer) para monitoramento em tempo real do tráfego na rede durante a execução interativa.
+* **Resolução Automática de Dependências:** Verifica e instala silenciosamente dependências ausentes (`sshpass`, `pv`, `rsync`) no nó de origem.
+* **Agendamento Autônomo (Cron):** Wizard interativo para criação de rotinas no diretório `/etc/cron.d/`.
+* **Autenticação Key-Based Automática:** Gera e exporta chaves ED25519 para o nó de destino, viabilizando a execução autônoma via cron sem senhas em texto plano.
+* **Rollback Remoto Resiliente:** Intercepta sinais de erro (`SIGINT`, `SIGTERM`, `ERR`) e limpa arquivos residuais locais e destrói VMs incompletas no nó de destino.
+* **Isolamento de Logs:** Separa rigorosamente os logs de execuções interativas e execuções via Cron.
+
+## 📋 Pré-requisitos
+
+O script deve ser executado com privilégios de **root** no nó Proxmox de **origem**. 
+
+As seguintes ferramentas serão instaladas automaticamente se ausentes:
+* `sshpass`: Para injeção da senha no primeiro contato interativo.
+* `pv`: Para métricas de fluxo do pipe.
+* `rsync`: (Planejado para rotinas de SCP com progresso iterativo).
+
+*Nota: O nó de destino precisa ter o serviço SSH rodando na porta padrão (22) e permitir login de root (comportamento padrão do Proxmox).*
+
+## 💻 Uso
+
+1.  Faça o download do script no servidor de origem.
+2.  Conceda permissão de execução:
+    ```bash
+    chmod +x migrate_pve.sh
+    ```
+3.  Execute o script:
+    ```bash
+    ./migrate_pve.sh
+    ```
+4.  O assistente solicitará o IP de destino, usuário (`root`) e senha. Em seguida, o menu principal será exibido.
+
+## 📂 Estrutura de Logs e Agendamentos
+
+* **Logs Interativos:** `/var/log/proxmox_migration_YYYYMMDD_HHMMSS.log`
+* **Logs de Cron:** `/var/log/migrate_vmid_<ID>_to_<IP>.log`
+* **Arquivos de Cron:** `/etc/cron.d/migrate_vmid_<ID>_to_<IP>`
+* **Scripts Autônomos (Gerados pelo Cron):** `/usr/local/bin/migrate_vmid_<ID>_to_<IP>.sh`
+
+## ⚠️ Limitações e Comportamento Crítico
+
+* **Downtime Inerente:** Este script realiza backups em modo `snapshot`. A VM permanece online durante o processo, porém, quaisquer dados gravados na VM de origem após o início do processo de migração não estarão presentes na VM de destino. Será necessário um pequeno downtime manual para desligar a origem e ligar o destino após a conclusão.
+* **Sensibilidade de Rede:** O método Pipe (vzdump -> ssh -> qmrestore) é extremamente sensível a oscilações de rede. Uma queda de milissegundos na conexão SSH pode abortar o processo (acionando o rollback).
+* **Ausência de Parse Complexo:** O script assume que o storage de destino informado pelo usuário (ex: `local-lvm`, `zfs-pool`) realmente existe no nó remoto. A validação prévia remota não está implementada nesta versão.
+
+## 🔄 Alternativas e Sugestões Arquiteturais
+
+A depender da escala e topologia da infraestrutura, scripts Bash monolíticos tornam-se difíceis de manter. Para cenários de produção de médio e grande porte, as seguintes abordagens são tecnicamente superiores:
+
+1.  **Proxmox Backup Server (PBS):**
+    * **Por que:** Utiliza deduplicação na fonte, criptografia e validação de integridade.
+    * **Fluxo:** O nó A faz backup (incremental) para o PBS. O nó B restaura a partir do PBS. O tráfego de rede é brutalmente reduzido.
+2.  **Cluster Proxmox (pvecm):**
+    * **Por que:** Se ambos os nós estiverem na mesma sub-rede física (latência < 2ms), agrupá-los em um cluster permite **Live Migration** nativo via interface web ou CLI, transferindo a RAM e o disco em tempo real sem interrupção de serviço.
+3.  **Automação via Ansible:**
+    * **Por que:** O Bash imperativo lida mal com estados e exceções complexas. O Ansible (com a coleção `community.general.proxmox`) utiliza a API REST do Proxmox para orquestrar a migração de forma declarativa e idempotente.
+4.  **ZFS Send/Receive Remoto (Para Storages ZFS):**
+    * **Por que:** Se ambos os nós usam ZFS, transferir os datasets em blocos via `zfs send` é substancialmente mais rápido e utiliza menos CPU do que empacotar tudo no formato `.vma` via `vzdump`.

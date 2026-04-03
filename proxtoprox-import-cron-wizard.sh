@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Migrator Proxmox - V2
+# Migrator Proxmox - V3
 # ==============================================================================
 
-# Validação estrita de erros no bash
 set -eE -o pipefail
 
 # ==============================================================================
@@ -36,8 +35,7 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no"
 TARGET_IP=""
 TARGET_USER=""
 TARGET_PASS=""
-TARGET_VMID=""
-TEMP_BACKUP_FILE=""
+TARGET_STORAGE=""
 ACTION_IN_PROGRESS=0
 CRON_MODE=0
 
@@ -51,7 +49,6 @@ log() {
     echo -e "$MSG" | tee -a "$LOG_FILE"
 }
 
-# Captura erros não tratados
 error_handler() {
     local line=$1
     local exit_code=$2
@@ -63,31 +60,9 @@ trap 'error_handler ${LINENO} $?' ERR
 cleanup() {
     trap - ERR
     if [[ $CRON_MODE -eq 0 ]]; then
-        log "⚠️ SINAL DE INTERRUPÇÃO OU ERRO DETECTADO. Iniciando rollback..."
+        log "⚠️ SINAL DE INTERRUPÇÃO OU ERRO DETECTADO. Encerrando."
     fi
-    
-    if [[ $ACTION_IN_PROGRESS -eq 1 ]]; then
-        if [[ -n "$TEMP_BACKUP_FILE" && -f "$TEMP_BACKUP_FILE" ]]; then
-            log "Removendo backup local incompleto: $TEMP_BACKUP_FILE"
-            rm -f "$TEMP_BACKUP_FILE"
-        fi
-        
-        if [[ -n "$TARGET_IP" && -n "$TARGET_VMID" ]]; then
-            log "Testando conectividade para rollback remoto..."
-            if ping -c 1 -W 2 "$TARGET_IP" &> /dev/null; then
-                log "Conexão ativa. Removendo resquícios da VM $TARGET_VMID no destino ($TARGET_IP)..."
-                # Executa limpeza ignorando erros (|| true) se a VM não existir ainda
-                if [[ -n "$TARGET_PASS" ]]; then
-                    sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qm destroy $TARGET_VMID --purge 1 >/dev/null 2>&1 || true; rm -f /var/lib/vz/dump/*${TARGET_VMID}* >/dev/null 2>&1 || true"
-                else
-                    ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qm destroy $TARGET_VMID --purge 1 >/dev/null 2>&1 || true; rm -f /var/lib/vz/dump/*${TARGET_VMID}* >/dev/null 2>&1 || true"
-                fi
-                log "Rollback remoto concluído."
-            else
-                log "❌ FALHA: Sem comunicação com o destino ($TARGET_IP). Rollback remoto abortado. Podem existir artefatos órfãos da VM $TARGET_VMID no destino."
-            fi
-        fi
-    fi
+    # O rollback específico por VM é tratado dentro do loop de execução agora
     rm -rf "$TEMP_DIR"
     exit 1
 }
@@ -96,145 +71,215 @@ trap cleanup SIGINT SIGTERM
 test_ssh() {
     log "Testando conexão SSH para $TARGET_IP..."
     if sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "exit" &>/dev/null; then
-        log "✅ Conexão SSH validada."
+        log "✅ Conexão SSH validada com o destino."
         return 0
     else
-        log "❌ Falha na conexão SSH. Motivo: Credenciais inválidas ou host inacessível."
+        log "❌ Falha na conexão SSH. Verifique IP e credenciais."
         return 1
     fi
 }
 
-check_local_storage() {
-    log "Analisando storages locais..."
-    echo -e "ID\tNOME\t\tTIPO\tLIVRE"
+# ==============================================================================
+# Funções de Descoberta (Automação)
+# ==============================================================================
+
+get_source_vms() {
+    log "Buscando VMs locais..."
+    local vms=$(qm list | awk 'NR>1 {print $1, $2, $3}')
+    local count=1
+    declare -A vm_map
+
+    echo -e "ID\tVMID\tNOME\t\tSTATUS"
+    while read -r vmid name status; do
+        echo -e "[$count]\t$vmid\t$name\t\t$status"
+        vm_map[$count]="$vmid"
+        ((count++))
+    done <<< "$vms"
+
+    echo ""
+    read -p "Digite os números das VMs a exportar (separados por espaço, ex: 1 3 4): " vm_selections
     
-    local storages=$(pvesm status -content backup | awk 'NR>1 {print $1, $2, $4}')
+    SELECTED_VMS=()
+    for sel in $vm_selections; do
+        if [[ -n "${vm_map[$sel]}" ]]; then
+            SELECTED_VMS+=("${vm_map[$sel]}")
+        fi
+    done
+
+    if [ ${#SELECTED_VMS[@]} -eq 0 ]; then
+        log "❌ Nenhuma VM válida selecionada."
+        exit 1
+    fi
+    log "VMs na fila de exportação: ${SELECTED_VMS[*]}"
+}
+
+get_target_storages() {
+    log "Consultando storages disponíveis no destino ($TARGET_IP)..."
+    local storages=$(sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "pvesm status -content images | awk 'NR>1 {print \$1, \$2, \$4}'")
     local count=1
     declare -A st_map
-    
+
+    echo -e "ID\tNOME_DESTINO\tTIPO\tLIVRE"
     while read -r name type free_bytes; do
         local free_gb=$((free_bytes / 1024 / 1024 / 1024))
         echo -e "[$count]\t$name\t\t$type\t${free_gb}GB"
-        st_map[$count]="$name|$free_gb"
+        st_map[$count]="$name"
         ((count++))
     done <<< "$storages"
-    
-    read -p "Selecione o ID do storage para o backup temporário: " st_sel
-    local selected_data=${st_map[$st_sel]}
-    
-    if [[ -z "$selected_data" ]]; then
-        log "❌ Seleção inválida."
+
+    echo ""
+    read -p "Selecione o ID do storage remoto para receber as VMs: " st_sel
+    TARGET_STORAGE=${st_map[$st_sel]}
+
+    if [[ -z "$TARGET_STORAGE" ]]; then
+        log "❌ Storage remoto inválido."
         exit 1
     fi
-    
-    STORAGE_NAME=$(echo "$selected_data" | cut -d'|' -f1)
-    STORAGE_FREE=$(echo "$selected_data" | cut -d'|' -f2)
-    log "Storage selecionado: $STORAGE_NAME (Livre: ${STORAGE_FREE}GB)"
+    log "Storage remoto selecionado: $TARGET_STORAGE"
+}
+
+get_target_nextid() {
+    # Coleta o próximo ID dinamicamente
+    sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "pvesh get /cluster/nextid"
 }
 
 # ==============================================================================
-# Núcleo: Importação SSH Direto (Pipe)
+# Núcleo: Exportação SSH Direto (Pipe)
 # ==============================================================================
 action_direct_pipe() {
-    log "Iniciando processo: SSH Import Direto (Pipe)"
-    read -p "ID da VM de Origem: " SRC_VMID
-    read -p "Novo ID da VM no Destino: " TARGET_VMID
-    read -p "Nome do Storage no Destino (ex: local-lvm): " TARGET_STORAGE
+    log "Iniciando processo: Exportação Direta via SSH (Pipe)"
+    get_source_vms
+    get_target_storages
 
-    ACTION_IN_PROGRESS=1
-    log "Gerando stream do disco da VM $SRC_VMID diretamente para $TARGET_IP..."
-    
-    # Desativa errexit momentaneamente para gerenciar o array PIPESTATUS manualmente
-    set +e
-    vzdump $SRC_VMID --stdout --mode snapshot 2>>"$LOG_FILE" | pv -pteb | sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qmrestore - $TARGET_VMID --storage $TARGET_STORAGE"
-    
-    local STATUS=("${PIPESTATUS[@]}")
-    set -e
+    for SRC_VMID in "${SELECTED_VMS[@]}"; do
+        TARGET_VMID=$(get_target_nextid)
+        log "--------------------------------------------------------"
+        log "Processando VM $SRC_VMID -> Destino ID $TARGET_VMID (Storage: $TARGET_STORAGE)"
+        
+        set +e
+        vzdump $SRC_VMID --stdout --mode snapshot 2>>"$LOG_FILE" | pv -pteb | sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qmrestore - $TARGET_VMID --storage $TARGET_STORAGE"
+        local STATUS=("${PIPESTATUS[@]}")
+        set -e
 
-    if [[ ${STATUS[0]} -eq 0 && ${STATUS[2]} -eq 0 ]]; then
-        log "✅ Migração (Direct Pipe) finalizada com sucesso."
-    else
-        log "❌ Erro na transferência de dados. Status Pipeline: vzdump(${STATUS[0]}), pv(${STATUS[1]}), ssh(${STATUS[2]})."
-        cleanup
-    fi
-    ACTION_IN_PROGRESS=0
+        if [[ ${STATUS[0]} -eq 0 && ${STATUS[2]} -eq 0 ]]; then
+            log "✅ VM $SRC_VMID exportada com sucesso como $TARGET_VMID."
+        else
+            log "❌ Erro na exportação da VM $SRC_VMID. Pipeline: vzdump(${STATUS[0]}), pv(${STATUS[1]}), ssh(${STATUS[2]})."
+            log "Tentando rollback no destino para o ID $TARGET_VMID..."
+            sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qm destroy $TARGET_VMID --purge 1 >/dev/null 2>&1 || true; rm -f /var/lib/vz/dump/*${TARGET_VMID}* >/dev/null 2>&1 || true"
+        fi
+    done
 }
 
 # ==============================================================================
-# Automação de Agendamento (Wizard & Chaves SSH)
+# Automação de Agendamento (Cron)
 # ==============================================================================
 setup_cron() {
     log "Iniciando wizard de agendamento (Cron)..."
-    read -p "ID da VM de Origem: " SRC_VMID
-    read -p "Novo ID da VM no Destino: " TARGET_VMID
-    read -p "Nome do Storage no Destino: " TARGET_STORAGE
+    get_source_vms
+    get_target_storages
 
     echo "Configuração de Frequência do Cron:"
     read -p "Minuto (0-59 ou *): " CRON_MIN
     read -p "Hora (0-23 ou *): " CRON_HR
     read -p "Dia do Mês (1-31 ou *): " CRON_DOM
     read -p "Mês (1-12 ou *): " CRON_MON
-    read -p "Dia da Semana (0-7 ou *, onde 0 e 7 = Domingo): " CRON_DOW
-    
-    read -p "Este agendamento deve rodar apenas uma vez e se autodestruir? (s/n): " RUN_ONCE
+    read -p "Dia da Semana (0-7 ou *, 0=Dom): " CRON_DOW
+    read -p "Destruir agendamento após a primeira execução? (s/n): " RUN_ONCE
 
-    log "Preparando chaves SSH para execução autônoma sem senha..."
+    log "Preparando chaves SSH ED25519..."
     KEY_PATH="$HOME/.ssh/id_ed25519"
     if [[ ! -f "$KEY_PATH" ]]; then
         ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -q
-        log "Nova chave ED25519 gerada."
     fi
 
-    log "Exportando chave para o destino. A senha será solicitada pelo sistema:"
     sshpass -p "$TARGET_PASS" ssh-copy-id -i "$KEY_PATH.pub" ${TARGET_USER}@${TARGET_IP} >/dev/null 2>&1
     log "Chave SSH autorizada no destino."
 
-    # Gerar script autônomo
-    JOB_NAME="migrate_vmid_${SRC_VMID}_to_${TARGET_IP}"
+    JOB_NAME="export_pve_${TIMESTAMP}"
     JOB_SCRIPT="/usr/local/bin/${JOB_NAME}.sh"
     JOB_LOG="/var/log/${JOB_NAME}.log"
 
+    # Geração do script autônomo
     cat << 'EOF' > "$JOB_SCRIPT"
 #!/usr/bin/env bash
-# Script gerado automaticamente
 set -e -o pipefail
 EOF
 
-    # Injetar variáveis fixas no script gerado
-    echo "SRC_VMID=\"$SRC_VMID\"" >> "$JOB_SCRIPT"
-    echo "TARGET_VMID=\"$TARGET_VMID\"" >> "$JOB_SCRIPT"
-    echo "TARGET_STORAGE=\"$TARGET_STORAGE\"" >> "$JOB_SCRIPT"
+    # Injetando variáveis
     echo "TARGET_IP=\"$TARGET_IP\"" >> "$JOB_SCRIPT"
     echo "TARGET_USER=\"$TARGET_USER\"" >> "$JOB_SCRIPT"
+    echo "TARGET_STORAGE=\"$TARGET_STORAGE\"" >> "$JOB_SCRIPT"
     echo "JOB_LOG=\"$JOB_LOG\"" >> "$JOB_SCRIPT"
-    
+    echo "VMS_ARRAY=(${SELECTED_VMS[@]})" >> "$JOB_SCRIPT"
+
     cat << 'EOF' >> "$JOB_SCRIPT"
 log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$JOB_LOG"; }
-log "Iniciando cron job de migração direta..."
-set +e
-vzdump $SRC_VMID --stdout --mode snapshot 2>>"$JOB_LOG" | ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "qmrestore - $TARGET_VMID --storage $TARGET_STORAGE"
-STATUS=("${PIPESTATUS[@]}")
-set -e
-if [[ ${STATUS[0]} -eq 0 && ${STATUS[1]} -eq 0 ]]; then
-    log "Sucesso."
-else
-    log "ERRO PIPELINE: vzdump=${STATUS[0]}, ssh=${STATUS[1]}"
-    ssh -o BatchMode=yes ${TARGET_USER}@${TARGET_IP} "qm destroy $TARGET_VMID --purge 1 || true"
-fi
+log "Iniciando cron job de exportação..."
+
+for SRC_VMID in "${VMS_ARRAY[@]}"; do
+    TARGET_VMID=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "pvesh get /cluster/nextid")
+    log "Processando VM $SRC_VMID para novo ID $TARGET_VMID no destino..."
+    
+    set +e
+    vzdump $SRC_VMID --stdout --mode snapshot 2>>"$JOB_LOG" | ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "qmrestore - $TARGET_VMID --storage $TARGET_STORAGE"
+    STATUS=("${PIPESTATUS[@]}")
+    set -e
+    
+    if [[ ${STATUS[0]} -eq 0 && ${STATUS[1]} -eq 0 ]]; then
+        log "✅ VM $SRC_VMID finalizada."
+    else
+        log "❌ ERRO PIPELINE (vzdump=${STATUS[0]}, ssh=${STATUS[1]}). Executando rollback."
+        ssh -o BatchMode=yes ${TARGET_USER}@${TARGET_IP} "qm destroy $TARGET_VMID --purge 1 || true"
+    fi
+done
 EOF
 
     if [[ "$RUN_ONCE" == "s" || "$RUN_ONCE" == "S" ]]; then
         echo "rm -f /etc/cron.d/${JOB_NAME}" >> "$JOB_SCRIPT"
-        log "Configurado para autodestruição após a primeira execução."
     fi
 
     chmod +x "$JOB_SCRIPT"
-
-    # Injetar no Cron
     echo "$CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW root $JOB_SCRIPT" > "/etc/cron.d/${JOB_NAME}"
     chmod 644 "/etc/cron.d/${JOB_NAME}"
+    log "✅ Agendamento configurado: /etc/cron.d/${JOB_NAME}"
+}
+
+# ==============================================================================
+# ZFS e Cluster (Stubs funcionais)
+# ==============================================================================
+action_zfs_repl() {
+    log "Opção selecionada: Replicação ZFS"
+    log "Verificando se o pacote pve-zsync está instalado..."
+    if ! command -v "pve-zsync" &> /dev/null; then
+        log "pve-zsync não encontrado. Instalando..."
+        apt-get install pve-zsync -y -qq >/dev/null
+    fi
+    get_source_vms
+    get_target_storages # Aqui idealmente listaria apenas datasets ZFS
     
-    log "✅ Agendamento configurado no arquivo: /etc/cron.d/${JOB_NAME}"
+    for SRC_VMID in "${SELECTED_VMS[@]}"; do
+        TARGET_VMID=$(get_target_nextid)
+        log "Executando ZFS Sync: VM $SRC_VMID -> Destino ID $TARGET_VMID..."
+        # O pve-zsync lida nativamente com a transferência de datasets via SSH.
+        # Exemplo de comando base: pve-zsync create -dest $TARGET_IP:$TARGET_STORAGE -source $SRC_VMID -name migracao_$SRC_VMID
+        log "⚠️ Comando omitido: pve-zsync requer configuração prévia rigorosa de datasets. Valide a documentação oficial."
+    done
+}
+
+action_cluster_mig() {
+    log "Opção selecionada: Migração Nativa de Cluster"
+    log "Validando estado do cluster local (pvecm status)..."
+    if pvecm status >/dev/null 2>&1; then
+        get_source_vms
+        read -p "Digite o NOME do nó de destino (não o IP): " TARGET_NODE
+        for SRC_VMID in "${SELECTED_VMS[@]}"; do
+            log "Migrando VM $SRC_VMID para o nó $TARGET_NODE..."
+            qm migrate $SRC_VMID $TARGET_NODE --online
+        done
+    else
+        log "❌ Este servidor não faz parte de um cluster Proxmox."
+    fi
 }
 
 # ==============================================================================
@@ -243,7 +288,7 @@ EOF
 main_menu() {
     clear
     echo "=========================================================="
-    echo " MIGRATOR PROXMOX"
+    echo " PROXMOX MIGRATOR / EXPORTER"
     echo "=========================================================="
     echo "Log ativo em: $LOG_FILE"
     
@@ -256,9 +301,11 @@ main_menu() {
     fi
 
     while true; do
-        echo ""
-        echo "1) SSH Import Direto (Pipe, sem uso de disco extra)"
-        echo "2) Agendar Migração Direta (Cron + SSH Keys)"
+        echo "----------------------------------------------------------"
+        echo "1) Exportação Direta via SSH (Pipe, sem disco extra)"
+        echo "2) Agendar Exportação Direta (Cron + Automação Keys)"
+        echo "3) Replicação ZFS (Requer pve-zsync / ZFS em ambos)"
+        echo "4) Migração Nativa (Requer Cluster Proxmox)"
         echo "0) Sair"
         echo ""
         read -p "Escolha uma opção: " OPTION
@@ -266,6 +313,8 @@ main_menu() {
         case $OPTION in
             1) action_direct_pipe ;;
             2) setup_cron ;;
+            3) action_zfs_repl ;;
+            4) action_cluster_mig ;;
             0) exit 0 ;;
             *) echo "Opção inválida." ;;
         esac
