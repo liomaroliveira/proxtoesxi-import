@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Proxmox VM Exporter & Migrator - V6
+# Proxmox VM Exporter & Migrator - V7
 # ==============================================================================
+
+set -eE -o pipefail
 
 # ==============================================================================
 # 1. Gestão de Dependências
@@ -42,7 +44,16 @@ log() {
     echo -e "$MSG" | tee -a "$LOG_FILE"
 }
 
+error_handler() {
+    local line=$1
+    local exit_code=$2
+    log "❌ ERRO CRÍTICO: Comando falhou na linha $line com código $exit_code."
+    handle_interrupt
+}
+trap 'error_handler ${LINENO} $?' ERR
+
 rollback() {
+    trap - ERR
     log "⚠️ INICIANDO ROLLBACK..."
     if [[ $ACTION_IN_PROGRESS -eq 1 ]]; then
         if [[ -n "$TEMP_BACKUP_FILE" && -f "$TEMP_BACKUP_FILE" ]]; then
@@ -58,8 +69,9 @@ rollback() {
 }
 
 handle_interrupt() {
+    trap - SIGINT SIGTERM ERR
     echo ""
-    log "⛔ INTERRUPÇÃO DETECTADA (Ctrl+C ou Erro)."
+    log "⛔ INTERRUPÇÃO DETECTADA."
     rollback
     echo "----------------------------------------------------------"
     read -p "Pressione ENTER para retornar ao Menu Principal ou digite 'q' para sair: " ans
@@ -67,28 +79,33 @@ handle_interrupt() {
         rm -rf "$TEMP_DIR"
         exit 1
     else
+        trap 'handle_interrupt' SIGINT SIGTERM
+        trap 'error_handler ${LINENO} $?' ERR
         main_menu
     fi
 }
 trap 'handle_interrupt' SIGINT SIGTERM
 
 # ==============================================================================
-# Gerenciamento de Cron Jobs Existentes no Crontab do Usuário
+# Gerenciamento de Cron Jobs (Arquitetura /etc/cron.d/)
 # ==============================================================================
 manage_existing_crons() {
     clear
     echo "=========================================================="
-    echo " GERENCIADOR DE AGENDAMENTOS (CRONTAB)"
+    echo " GERENCIADOR DE AGENDAMENTOS (/etc/cron.d/)"
     echo "=========================================================="
     
-    mapfile -t EXISTING_JOBS < <(crontab -l 2>/dev/null | grep "pve_export_")
+    local cron_files=(/etc/cron.d/pve_export_*)
     
-    if [ ${#EXISTING_JOBS[@]} -gt 0 ]; then
-        echo "Agendamentos ativos encontrados na fila:"
-        local idx=1
-        for job in "${EXISTING_JOBS[@]}"; do
-            echo "[$idx] $job"
-            ((idx++))
+    if [[ -e "${cron_files[0]}" ]]; then
+        echo "Agendamentos ativos encontrados:"
+        local count=1
+        declare -A cron_map
+        echo -e "ID\tARQUIVO"
+        for file in "${cron_files[@]}"; do
+            echo -e "[$count]\t$(basename "$file")"
+            cron_map[$count]="$file"
+            ((count++))
         done
         
         echo "----------------------------------------------------------"
@@ -96,26 +113,24 @@ manage_existing_crons() {
         
         if [ -n "$REMOVE_OPT" ]; then
             if [[ "${REMOVE_OPT^^}" == "TODOS" ]]; then
-                crontab -l 2>/dev/null | grep -v "pve_export_" | crontab -
-                echo "[v] Todos os agendamentos de exportação foram removidos."
+                rm -f /etc/cron.d/pve_export_*
+                echo "[v] Todos os agendamentos foram removidos."
                 sleep 2
-            elif [[ "$REMOVE_OPT" =~ ^[0-9]+$ ]] && [ "$REMOVE_OPT" -le "${#EXISTING_JOBS[@]}" ]; then
-                JOB_TO_REMOVE="${EXISTING_JOBS[$((REMOVE_OPT-1))]}"
-                ESCAPED_JOB=$(echo "$JOB_TO_REMOVE" | sed 's/[][\.^$*]/\\&/g')
-                crontab -l 2>/dev/null | grep -v "$ESCAPED_JOB" | crontab -
-                echo "[v] Agendamento $REMOVE_OPT removido."
+            elif [[ -n "${cron_map[$REMOVE_OPT]}" ]]; then
+                rm -f "${cron_map[$REMOVE_OPT]}"
+                echo "[v] Agendamento ${cron_map[$REMOVE_OPT]} removido."
                 sleep 2
             fi
         fi
     else
-        echo "Nenhum agendamento ativo encontrado no Crontab."
+        echo "Nenhum agendamento ativo encontrado."
         echo "----------------------------------------------------------"
     fi
 }
 
 ask_execution_mode() {
     echo ""
-    read -p "Deseja gerar um agendamento (Crontab) para execução autônoma? (s/N): " cron_ans
+    read -p "Deseja gerar um agendamento (Cron) para execução autônoma? (s/N): " cron_ans
     if [[ "$cron_ans" == "s" || "$cron_ans" == "S" ]]; then
         IS_CRON_MODE=1
         log "Modo selecionado: CRIAÇÃO DE AGENDAMENTO (Wizard)."
@@ -163,13 +178,13 @@ get_source_vms() {
         if [[ -n "${vm_map[$sel]}" ]]; then SELECTED_VMS+=("${vm_map[$sel]}"); fi
     done
     if [ ${#SELECTED_VMS[@]} -eq 0 ]; then
-        log "Nenhuma VM válida. Retornando..."
+        log "Nenhuma VM válida selecionada."
         handle_interrupt
     fi
 }
 
 get_local_storage_for_backup() {
-    log "Mapeando storages locais com suporte a backup (vzdump)..."
+    log "Mapeando storages locais com suporte a backup..."
     local storages=$(pvesm status -content backup | awk 'NR>1 {print $1, $2, $4}')
     local count=1
     declare -A st_map
@@ -207,9 +222,6 @@ get_target_storages() {
     log "Selecionado remoto: $TARGET_STORAGE"
 }
 
-# ==============================================================================
-# Validação e Injeção de Chave SSH Otimizada
-# ==============================================================================
 setup_ssh_keys() {
     log "Validando comunicação via Chaves SSH..."
     KEY_PATH="$HOME/.ssh/id_ed25519"
@@ -247,7 +259,12 @@ execute_backup_scp() {
         
         log "--------------------------------------------------------"
         log "Iniciando Backup Local da VM $SRC_VMID..."
-        if ! vzdump $SRC_VMID --storage $LOCAL_STORAGE_NAME --compress zstd --mode snapshot > "$TEMP_DIR/dump.log" 2>&1; then
+        set +e
+        vzdump $SRC_VMID --storage $LOCAL_STORAGE_NAME --compress zstd --mode snapshot > "$TEMP_DIR/dump.log" 2>&1
+        local DUMP_STATUS=$?
+        set -e
+        
+        if [ $DUMP_STATUS -ne 0 ]; then
             log "❌ Falha no vzdump."
             cat "$TEMP_DIR/dump.log" >> "$LOG_FILE"
             handle_interrupt
@@ -267,7 +284,12 @@ execute_backup_scp() {
         REMOTE_FILE="/var/lib/vz/dump/$(basename "$TEMP_BACKUP_FILE")"
         log "Restaurando $REMOTE_FILE no destino como ID $CURRENT_TARGET_VMID..."
         
-        if ! sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qmrestore $REMOTE_FILE $CURRENT_TARGET_VMID --storage $TARGET_STORAGE"; then
+        set +e
+        sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qmrestore $REMOTE_FILE $CURRENT_TARGET_VMID --storage $TARGET_STORAGE"
+        local RESTORE_STATUS=$?
+        set -e
+        
+        if [ $RESTORE_STATUS -ne 0 ]; then
             log "❌ Falha no qmrestore remoto."
             handle_interrupt
         fi
@@ -296,8 +318,10 @@ execute_direct_pipe() {
         log "--------------------------------------------------------"
         log "Iniciando Pipe Direto: VM $SRC_VMID -> Destino ID $CURRENT_TARGET_VMID..."
         
+        set +e
         vzdump $SRC_VMID --stdout --mode snapshot 2>>"$LOG_FILE" | pv -pteb | sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qmrestore - $CURRENT_TARGET_VMID --storage $TARGET_STORAGE"
         local STATUS=("${PIPESTATUS[@]}")
+        set -e
         
         if [[ ${STATUS[0]} -eq 0 && ${STATUS[2]} -eq 0 ]]; then
             log "🎉 VM $SRC_VMID exportada com sucesso."
@@ -310,7 +334,7 @@ execute_direct_pipe() {
 }
 
 # ==============================================================================
-# Geração de Agendamento (Crontab do Usuário)
+# Geração de Agendamento (/etc/cron.d/)
 # ==============================================================================
 generate_cron_script() {
     local METHOD=$1
@@ -382,14 +406,12 @@ generate_cron_script() {
         esac
     fi
 
-    # Configura chaves SSH blindadas
     setup_ssh_keys
 
     JOB_NAME="pve_export_${TIMESTAMP}"
     JOB_SCRIPT="/usr/local/bin/${JOB_NAME}.sh"
     JOB_LOG="/var/log/${JOB_NAME}.log"
 
-    # Criação do Script Autônomo
     cat << 'EOF' > "$JOB_SCRIPT"
 #!/usr/bin/env bash
 EOF
@@ -406,8 +428,10 @@ log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$JOB_LOG"; }
 for SRC_VMID in "${VMS_ARRAY[@]}"; do
     TARGET_VMID=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "pvesh get /cluster/nextid")
     log "Executando Pipe: VM $SRC_VMID para novo ID $TARGET_VMID..."
+    set +e
     vzdump $SRC_VMID --stdout --mode snapshot 2>>"$JOB_LOG" | ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "qmrestore - $TARGET_VMID --storage $TARGET_STORAGE"
     STATUS=("${PIPESTATUS[@]}")
+    set -e
     if [[ ${STATUS[0]} -ne 0 || ${STATUS[1]} -ne 0 ]]; then
         log "ERRO: Desfazendo VM $TARGET_VMID"
         ssh -o BatchMode=yes ${TARGET_USER}@${TARGET_IP} "qm destroy $TARGET_VMID --purge 1 || true"
@@ -432,19 +456,18 @@ done
 EOF
     fi
 
-    # Lógica de Autodestruição via Crontab e deleção do arquivo
+    # Lógica de Autodestruição Baseada em Arquivos
     if [[ "$RUN_ONCE" == "s" || "$RUN_ONCE" == "S" ]]; then
         cat << EOF >> "$JOB_SCRIPT"
 log "Autodestruindo agendamento único..."
-crontab -l 2>/dev/null | grep -v "$JOB_SCRIPT" | crontab -
+rm -f "/etc/cron.d/${JOB_NAME}"
 rm -f "\$0"
 EOF
     fi
 
     chmod +x "$JOB_SCRIPT"
     
-    # Tratamento final das variáveis Cron para evitar quebra de sintaxe
-    # Transforma vazios em '*' e remove eventuais zeros à esquerda indesejados (ex: 08)
+    # Sanitização: Remove zeros à esquerda (ex: 08) e converte nulo/vazio para '*'
     CRON_DOM=$(echo "${CRON_DOM:-*}" | sed 's/^0*//')
     CRON_MON=$(echo "${CRON_MON:-*}" | sed 's/^0*//')
     CRON_DOW=${CRON_DOW:-*}
@@ -456,14 +479,13 @@ EOF
     [[ -z "$CRON_HR" ]] && CRON_HR="0"
     [[ -z "$CRON_MIN" ]] && CRON_MIN="0"
 
-    # Injeta no Crontab do usuário
-    crontab -l 2>/dev/null | grep -v "$JOB_SCRIPT" > /tmp/crontmp
-    echo "$CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW $JOB_SCRIPT > /dev/null 2>&1" >> /tmp/crontmp
-    crontab /tmp/crontmp
-    rm /tmp/crontmp
+    # Criação do arquivo físico no cron.d
+    echo "$CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW root $JOB_SCRIPT > /dev/null 2>&1" > "/etc/cron.d/${JOB_NAME}"
+    chmod 644 "/etc/cron.d/${JOB_NAME}"
     
     log "✅ AGENDAMENTO CRIADO COM SUCESSO."
-    log "Sintaxe Cron Aplicada: $CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW"
+    log "Arquivo: /etc/cron.d/${JOB_NAME}"
+    log "Sintaxe Aplicada: $CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW root"
     log ">>> Para monitorar na hora agendada: tail -f $JOB_LOG"
     
     echo ""
