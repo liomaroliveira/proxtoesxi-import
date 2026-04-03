@@ -1,450 +1,507 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ==============================================================================
+# Proxmox VM Exporter & Migrator - V6
+# ==============================================================================
 
-# ==========================================
-# WIZARD GERADOR DE MIGRAÇÃO AUTÔNOMA (V23)
-# ==========================================
-
-WIZARD_LOG="/var/log/migracao_esxi_proxmox.log"
-log_w() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] [WIZARD] $1" | tee -a "$WIZARD_LOG"; }
-
-clear
-echo "======================================================"
-echo "WIZARD DE AGENDAMENTO DE MIGRAÇÃO ESXi -> PROXMOX"
-echo "======================================================"
-
-# --- 0. GESTOR DE CRONTAB EXISTENTE ---
-mapfile -t EXISTING_JOBS < <(crontab -l 2>/dev/null | grep "executa_migracao_")
-if [ ${#EXISTING_JOBS[@]} -gt 0 ]; then
-    echo -e "\n=== AGENDAMENTOS EXISTENTES NA FILA ==="
-    idx=1
-    for job in "${EXISTING_JOBS[@]}"; do
-        echo "[$idx] $job"
-        ((idx++))
-    done
-    echo "======================================================"
-    read -p "Deseja remover algum? (Digite o NÚMERO, 'TODOS' ou Enter para ignorar): " REMOVE_OPT
-    if [ -n "$REMOVE_OPT" ]; then
-        if [[ "${REMOVE_OPT^^}" == "TODOS" ]]; then
-            crontab -l | grep -v "executa_migracao_" | crontab -
-            echo "[v] Todos os agendamentos foram removidos do Crontab."
-            log_w "Todos os agendamentos previos foram apagados pelo usuario."
-        elif [[ "$REMOVE_OPT" =~ ^[0-9]+$ ]] && [ "$REMOVE_OPT" -le "${#EXISTING_JOBS[@]}" ]; then
-            JOB_TO_REMOVE="${EXISTING_JOBS[$((REMOVE_OPT-1))]}"
-            ESCAPED_JOB=$(echo "$JOB_TO_REMOVE" | sed 's/[][\.^$*]/\\&/g')
-            crontab -l | grep -v "$ESCAPED_JOB" | crontab -
-            echo "[v] Agendamento $REMOVE_OPT removido."
-            log_w "Agendamento removido: $JOB_TO_REMOVE"
-        fi
-    fi
+# ==============================================================================
+# 1. Gestão de Dependências
+# ==============================================================================
+DEPENDENCIES=("sshpass" "pv" "rsync")
+MISSING_DEPS=()
+for dep in "${DEPENDENCIES[@]}"; do
+    if ! command -v "$dep" &> /dev/null; then MISSING_DEPS+=("$dep"); fi
+done
+if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
+    echo "[!] Instalando dependências ausentes: ${MISSING_DEPS[*]}..."
+    apt-get update -qq && apt-get install -y -qq "${MISSING_DEPS[@]}" > /dev/null 2>&1
 fi
 
-log_w "Iniciando criacao de nova fila V23..."
+# ==============================================================================
+# Variáveis de Estado Global
+# ==============================================================================
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="/var/log/pve_export_interativo_${TIMESTAMP}.log"
+TEMP_DIR="/tmp/pve_export_$$"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no"
 
-# --- 1. CONFIGURAÇÕES GLOBAIS ---
-echo -e "\n=== MODO DE IMPORTAÇÃO ==="
-echo "[1] Via Storage Plugin Proxmox (Padrão)"
-echo "[2] Via SSHFS (Monta o ESXi remoto)"
-echo "[3] Via USB/Armazenamento Local (Para backups offline)"
-read -p "Escolha [1-3]: " MODO_IMPORT
-log_w "Modo de Importacao: $MODO_IMPORT"
+IS_CRON_MODE=0
+TARGET_IP=""
+TARGET_USER=""
+TARGET_PASS=""
+ACTION_IN_PROGRESS=0
+TEMP_BACKUP_FILE=""
+CURRENT_TARGET_VMID=""
 
-echo -e "\n=== DESTINO ==="
-mapfile -t DEST_STORAGES < <(pvesm status | awk 'NR>1 && $4>0 {print $1}')
-for i in "${!DEST_STORAGES[@]}"; do echo "[$((i+1))] ${DEST_STORAGES[$i]}"; done
-read -p "Número do storage de Destino: " n_dest
-STORAGE_DESTINO="${DEST_STORAGES[$((n_dest-1))]}"
+mkdir -p "$TEMP_DIR"
 
-echo -e "\n=== OPÇÕES DE AUTOMAÇÃO ==="
-read -p "Injetar ISO pós-instalação (Rede/Agent)? [1] Sim / [0] Não: " OPT_INJECT
-read -p "Ligar VMs no Proxmox no final? [1] Sim / [0] Não: " OPT_START
-read -p "Pre-Flight (Desligar + Consolidar na origem)? [1] Sim / [0] Não: " OPT_PREFLIGHT
-read -p "Religar VMs na origem no final? [1] Sim / [0] Não: " OPT_RELIGAR
-
-# --- 2. CREDENCIAIS E ORIGEM ---
-ESXI_HOST=""
-ESXI_USER="root"
-STORAGE_ORIGEM=""
-DS_NOME=""
-USB_PATH=""
-
-if [ "$MODO_IMPORT" == "1" ] || [ "$MODO_IMPORT" == "2" ] || [ "$OPT_PREFLIGHT" == "1" ] || [ "$OPT_RELIGAR" == "1" ]; then
-    read -p "IP do host ESXi de origem: " ESXI_HOST
-    echo "[*] Testando conexão SSH sem senha com $ESXI_HOST..."
-    log_w "Testando conexao SSH sem senha com $ESXI_HOST..."
-    
-    if ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$ESXI_USER@$ESXI_HOST" "echo OK" &>/dev/null; then
-        echo "[!] ERRO: Conexão SSH sem senha falhou. Configure as chaves RSA."
-        log_w "ERRO: Conexao SSH falhou."
-        exit 1
-    fi
-    echo "[v] Conexão SSH validada com sucesso."
-    log_w "Conexao SSH validada com sucesso."
-fi
-
-declare -A MAPA_VMS
-if [ "$MODO_IMPORT" == "1" ]; then
-    mapfile -t ESXI_STORAGES < <(pvesm status | awk 'NR>1 && $2=="esxi" {print $1}')
-    for i in "${!ESXI_STORAGES[@]}"; do echo "[$((i+1))] ${ESXI_STORAGES[$i]}"; done
-    read -p "Número do storage Origem ESXi: " n_origem
-    STORAGE_ORIGEM="${ESXI_STORAGES[$((n_origem-1))]}"
-    mapfile -t VMS_BRUTAS < <(pvesm list "$STORAGE_ORIGEM" | awk 'NR>1 {print $1}' | grep "\.vmx$")
-
-elif [ "$MODO_IMPORT" == "2" ]; then
-    echo -e "\n[*] Buscando Datastores disponíveis no ESXi via SSH..."
-    mapfile -t ESXI_DATASTORES < <(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "ls -1 /vmfs/volumes | grep -vE '^[0-9a-fA-F]{8}-'")
-    
-    if [ ${#ESXI_DATASTORES[@]} -eq 0 ]; then
-        echo "[x] Nenhum Datastore encontrado no host remoto. Abortando."
-        exit 1
-    fi
-    
-    for i in "${!ESXI_DATASTORES[@]}"; do echo "[$((i+1))] ${ESXI_DATASTORES[$i]}"; done
-    read -p "Número do Datastore Origem ESXi: " n_ds_origem
-    DS_NOME="${ESXI_DATASTORES[$((n_ds_origem-1))]}"
-    
-    echo "[*] Mapeando VMs no datastore $DS_NOME..."
-    mkdir -p /mnt/esxi_sshfs
-    if ! command -v sshfs &> /dev/null; then apt-get update >/dev/null && apt-get install sshfs -y >/dev/null; fi
-    
-    REAL_PATH=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "readlink -f /vmfs/volumes/$DS_NOME")
-    sshfs "$ESXI_USER@$ESXI_HOST:$REAL_PATH" /mnt/esxi_sshfs -o StrictHostKeyChecking=no,allow_other,IdentityFile=~/.ssh/id_rsa
-    
-    mapfile -t VMS_BRUTAS < <(find /mnt/esxi_sshfs -maxdepth 2 -name "*.vmx")
-    umount -f /mnt/esxi_sshfs &>/dev/null
-
-elif [ "$MODO_IMPORT" == "3" ]; then
-    read -p "Caminho ABSOLUTO do diretório USB: " USB_PATH
-    mapfile -t VMS_BRUTAS < <(find "$USB_PATH" -maxdepth 2 -name "*.vmx")
-fi
-
-for i in "${!VMS_BRUTAS[@]}"; do MAPA_VMS[$((i+1))]="${VMS_BRUTAS[$i]}"; done
-if [ ${#MAPA_VMS[@]} -eq 0 ]; then
-    echo "[x] Nenhuma VM encontrada no armazenamento selecionado. Abortando."
-    exit 1
-fi
-
-# --- 3. SELEÇÃO E VLANs ---
-echo -e "\n=== VMS ENCONTRADAS ==="
-for i in $(seq 1 ${#VMS_BRUTAS[@]}); do echo "[$i] $(basename "${MAPA_VMS[$i]}")"; done
-echo "======================================================"
-read -p "Quais VMs deseja agendar? (ex: 1 3 ou TODAS): " ESCOLHA_USER
-
-ARRAY_VMS_CODE=""
-if [[ "${ESCOLHA_USER^^}" == "TODAS" ]]; then
-    ARRAY_VMS_CODE="    \"TODAS\""
-else
-    for num in $ESCOLHA_USER; do
-        ARQ_VMX=$(basename "${MAPA_VMS[$num]}")
-        read -p "VLANs para $ARQ_VMX (separadas por espaço, Enter p/ vazia): " vlan_input
-        ARRAY_VMS_CODE="${ARRAY_VMS_CODE}
-    \"${ARQ_VMX}|${vlan_input}\""
-    done
-fi
-
-# --- 4. CONFIGURAÇÃO DE TEMPO (CRONOLOGIA) ---
-echo -e "\n=== AGENDAMENTO CRON AVANÇADO ==="
-read -p "Deseja agendar a execução agora? [1] Sim / [0] Não: " OPT_CRON
-
-IS_RECURRING="0"
-if [ "$OPT_CRON" == "1" ]; then
-    read -p "Hora de execução (0-23): " CRON_H
-    read -p "Minuto de execução (0-59): " CRON_M
-    echo -e "\nData da execução:"
-    echo "[1] Hoje"
-    echo "[2] Amanhã"
-    echo "[3] Data Específica (Dia e Mês)"
-    echo "[4] Recorrente (Todos os dias)"
-    read -p "Escolha [1-4]: " TIPO_DATA
-
-    if [ "$TIPO_DATA" == "1" ]; then
-        CRON_D=$(date +'%d')
-        CRON_MON=$(date +'%m')
-    elif [ "$TIPO_DATA" == "2" ]; then
-        CRON_D=$(date -d "tomorrow" +'%d')
-        CRON_MON=$(date -d "tomorrow" +'%m')
-    elif [ "$TIPO_DATA" == "3" ]; then
-        read -p "Dia (1-31): " CRON_D
-        read -p "Mês (1-12): " CRON_MON
-    elif [ "$TIPO_DATA" == "4" ]; then
-        CRON_D="*"
-        CRON_MON="*"
-        IS_RECURRING="1"
-    fi
-fi
-
-# --- 5. GERAÇÃO DO SCRIPT AUTÔNOMO E LOG ISOLADO ---
-UNIQUE_ID=$(date +'%Y%m%d_%H%M%S')
-SCRIPT_DESTINO="/root/executa_migracao_${UNIQUE_ID}.sh"
-EXEC_LOG="/var/log/migracao_exec_${UNIQUE_ID}.log"
-
-echo -e "\n[*] Gerando o script autônomo incremental em $SCRIPT_DESTINO..."
-
-cat << EOF > "$SCRIPT_DESTINO"
-#!/bin/bash
-# ==========================================
-# SCRIPT GERADO AUTOMATICAMENTE PELO WIZARD V23
-# ==========================================
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-MY_SCRIPT_PATH="$SCRIPT_DESTINO"
-MY_EXEC_LOG="$EXEC_LOG"
-IS_RECURRING="$IS_RECURRING"
-
-MODO_IMPORT="$MODO_IMPORT"
-STORAGE_DESTINO="$STORAGE_DESTINO"
-OPT_INJECT="$OPT_INJECT"
-OPT_START="$OPT_START"
-OPT_PREFLIGHT="$OPT_PREFLIGHT"
-OPT_RELIGAR="$OPT_RELIGAR"
-ESXI_HOST="$ESXI_HOST"
-ESXI_USER="$ESXI_USER"
-STORAGE_ORIGEM="$STORAGE_ORIGEM"
-DS_NOME="$DS_NOME"
-USB_PATH="$USB_PATH"
-
-VMS_TARGET=( $ARRAY_VMS_CODE
-)
-
-EOF
-
-cat << 'EOF' >> "$SCRIPT_DESTINO"
-# ================= INÍCIO DO MOTOR =================
-CURRENT_VMID=""
-IMPORT_PID=""
-ISO_SCRIPT_PATH="/var/lib/vz/template/iso/pos_install_esxi.iso"
-
-log_msg() { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$MY_EXEC_LOG"; }
-
-log_msg "======================================================"
-log_msg "INICIANDO FILA DE MIGRAÇÃO: $MY_SCRIPT_PATH"
-log_msg "======================================================"
-
-cleanup() {
-    log_msg "\n[!] AVISO: INTERRUPÇÃO DETECTADA!"
-    if [ -n "$IMPORT_PID" ]; then kill -9 $IMPORT_PID 2>/dev/null; fi
-    if [ -n "$CURRENT_VMID" ]; then qm destroy $CURRENT_VMID --purge 1 >> "$MY_EXEC_LOG" 2>&1; fi
-    umount -f /mnt/esxi_sshfs &>/dev/null
-    exit 1
-}
-trap cleanup SIGINT SIGTERM
-
-processar_saida() {
-    local prev_was_trans=0; local last_trans=""
-    while IFS= read -r line; do
-        if [[ "$line" == transferred* ]]; then
-            echo -en "\r[$(date +'%H:%M:%S')] $line\033[K"
-            last_trans="$line"; prev_was_trans=1
-        else
-            if [[ $prev_was_trans -eq 1 ]]; then echo ""; echo "[$(date +'%H:%M:%S')] $last_trans" >> "$MY_EXEC_LOG"; prev_was_trans=0; fi
-            log_msg "$line"
-        fi
-    done
-    if [[ $prev_was_trans -eq 1 ]]; then echo ""; log_msg "$last_trans"; fi
+# ==============================================================================
+# Funções de Log e Tratamento de Interrupção
+# ==============================================================================
+log() {
+    local MSG="[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "$MSG" | tee -a "$LOG_FILE"
 }
 
-if [ "$OPT_INJECT" == "1" ]; then
-    for pkg in genisoimage; do
-        if ! command -v $pkg &> /dev/null; then apt-get update >/dev/null && apt-get install $pkg -y >/dev/null; fi
-    done
-    TMP_DIR=$(mktemp -d)
-    cat << 'INNER_EOF' > "$TMP_DIR/pos_import_esxi.sh"
-#!/bin/bash
-LOG="/root/migracao_completa.log"
-log() { echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG"; }
-log "=== Iniciando validacao de rede ==="
-mapfile -t NEW_IFS < <(ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|altname')
-mapfile -t OLD_IFS < <(awk '/^iface/ && $2 != "lo" {print $2}' /etc/network/interfaces | sort -u)
-if [ ${#NEW_IFS[@]} -eq 0 ]; then log "ERRO: Interfaces nao detectadas."; exit 1; fi
-ALTERADO=0
-for i in "${!OLD_IFS[@]}"; do
-    if [ -n "${NEW_IFS[$i]}" ] && [ "${OLD_IFS[$i]}" != "${NEW_IFS[$i]}" ]; then
-        sed -i "s/\b${OLD_IFS[$i]}\b/${NEW_IFS[$i]}/g" /etc/network/interfaces
-        ALTERADO=1
-    fi
-done
-if [ $ALTERADO -eq 1 ]; then systemctl restart networking; sleep 5; fi
-if ping -c 3 google.com &> /dev/null; then
-    apt-get update -y && apt-get install qemu-guest-agent -y && systemctl enable --now qemu-guest-agent && apt-get purge open-vm-tools -y && apt-get autoremove -y
-    log "SUCESSO: Agent instalado."
-fi
-INNER_EOF
-    chmod +x "$TMP_DIR/pos_import_esxi.sh"
-    genisoimage -quiet -J -R -V "POS_INSTALL" -o "$ISO_SCRIPT_PATH" "$TMP_DIR"
-    rm -rf "$TMP_DIR"
-fi
-
-declare -A MAPA_VMS
-if [ "$MODO_IMPORT" == "1" ]; then
-    mapfile -t VMS_BRUTAS < <(pvesm list "$STORAGE_ORIGEM" | awk 'NR>1 {print $1}' | grep "\.vmx$")
-elif [ "$MODO_IMPORT" == "2" ]; then
-    if ! command -v sshfs &> /dev/null; then apt-get update >/dev/null && apt-get install sshfs -y >/dev/null; fi
-    mkdir -p /mnt/esxi_sshfs
-    REAL_PATH=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "readlink -f /vmfs/volumes/$DS_NOME")
-    sshfs "$ESXI_USER@$ESXI_HOST:$REAL_PATH" /mnt/esxi_sshfs -o StrictHostKeyChecking=no,allow_other,IdentityFile=~/.ssh/id_rsa
-    mapfile -t VMS_BRUTAS < <(find /mnt/esxi_sshfs -maxdepth 2 -name "*.vmx")
-elif [ "$MODO_IMPORT" == "3" ]; then
-    mapfile -t VMS_BRUTAS < <(find "$USB_PATH" -maxdepth 2 -name "*.vmx")
-fi
-
-for i in "${!VMS_BRUTAS[@]}"; do MAPA_VMS[$((i+1))]="${VMS_BRUTAS[$i]}"; done
-
-for target in "${VMS_TARGET[@]}"; do
-    if [ "$target" == "TODAS" ]; then
-        for i in "${!MAPA_VMS[@]}"; do
-            ARQ_VMX=$(basename "${MAPA_VMS[$i]}")
-            TARGETS_FINAL+=("$i|$ARQ_VMX|")
-        done
-        break
-    else
-        nome_alvo=$(echo "$target" | cut -d'|' -f1)
-        vlans_alvo=$(echo "$target" | cut -d'|' -f2)
-        for i in "${!MAPA_VMS[@]}"; do
-            if [ "$(basename "${MAPA_VMS[$i]}")" == "$nome_alvo" ]; then
-                TARGETS_FINAL+=("$i|$nome_alvo|$vlans_alvo")
-            fi
-        done
-    fi
-done
-
-for info in "${TARGETS_FINAL[@]}"; do
-    num_vm=$(echo "$info" | cut -d'|' -f1)
-    ARQ_VMX=$(echo "$info" | cut -d'|' -f2)
-    VLANS_REQ=$(echo "$info" | cut -d'|' -f3)
-    caminho_vm="${MAPA_VMS[$num_vm]}"
-    CURRENT_VMID=$(pvesh get /cluster/nextid)
-    NOME_LIMPO=$(grep -i '^displayName' "$caminho_vm" 2>/dev/null | cut -d'"' -f2 | tr -d '\r')
-    [ -z "$NOME_LIMPO" ] && NOME_LIMPO="$ARQ_VMX"
-
-    log_msg "------------------------------------------------------"
-    log_msg "Processando: $NOME_LIMPO -> ID Proxmox $CURRENT_VMID"
-
-    if [ "$OPT_PREFLIGHT" == "1" ] && [[ "$MODO_IMPORT" == "1" || "$MODO_IMPORT" == "2" ]]; then
-        ESXI_VMID=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/getallvms" | grep "$ARQ_VMX" | awk '{print $1}' | head -n 1)
-        if [ -n "$ESXI_VMID" ]; then
-            if ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.getstate $ESXI_VMID" | grep -qi 'Powered on'; then
-                ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.off $ESXI_VMID" > /dev/null
-                sleep 5
-            fi
-            
-            ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/snapshot.create $ESXI_VMID 'Migracao-Proxmox' 'Forced-Consolidation' 0 0" > /dev/null
-            ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/snapshot.removeall $ESXI_VMID" > /dev/null
-            
-            while true; do
-                TASKS=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/get.tasklist $ESXI_VMID" | grep -o "haTask-[a-zA-Z0-9.-]*")
-                IS_RUNNING=0
-                for t in $TASKS; do
-                    STATUS=$(ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vimsvc/task_info $t" 2>/dev/null | grep -iE 'state =' | awk -F'"' '{print $2}')
-                    if [ "$STATUS" == "running" ]; then IS_RUNNING=1; break; fi
-                done
-                if [ "$IS_RUNNING" == "0" ]; then break; fi
-                sleep 5
-            done
+rollback() {
+    log "⚠️ INICIANDO ROLLBACK..."
+    if [[ $ACTION_IN_PROGRESS -eq 1 ]]; then
+        if [[ -n "$TEMP_BACKUP_FILE" && -f "$TEMP_BACKUP_FILE" ]]; then
+            log "Limpando backup local incompleto: $TEMP_BACKUP_FILE"
+            rm -f "$TEMP_BACKUP_FILE"
+        fi
+        if [[ -n "$CURRENT_TARGET_VMID" && -n "$TARGET_IP" ]]; then
+            log "Tentando limpar VM $CURRENT_TARGET_VMID órfã no destino ($TARGET_IP)..."
+            sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qm destroy $CURRENT_TARGET_VMID --purge 1 >/dev/null 2>&1 || true; rm -f /var/lib/vz/dump/*${CURRENT_TARGET_VMID}* >/dev/null 2>&1 || true"
         fi
     fi
+    ACTION_IN_PROGRESS=0
+}
 
-    if [ "$MODO_IMPORT" == "1" ]; then
-        qm import $CURRENT_VMID "$caminho_vm" --storage "$STORAGE_DESTINO" > >(processar_saida) 2>&1 &
-        wait $!
-        EXIT_CODE=$?
-        if [ $EXIT_CODE -eq 0 ]; then
-            OLD_CORES=$(qm config $CURRENT_VMID | awk '/^cores:/ {print $2}'); [ -z "$OLD_CORES" ] && OLD_CORES=1
-            OLD_SOCKETS=$(qm config $CURRENT_VMID | awk '/^sockets:/ {print $2}'); [ -z "$OLD_SOCKETS" ] && OLD_SOCKETS=1
-            qm set $CURRENT_VMID --sockets 1 --cores $((OLD_CORES * OLD_SOCKETS)) --cpu host --vga virtio --scsihw virtio-scsi-single --agent 1 --onboot 1
-            DISCO_BOOT=$(qm config $CURRENT_VMID | grep -E '^(scsi|ide|sata|virtio)[0-9]+:' | grep -v 'cdrom' | head -n 1 | awk -F: '{print $1}')
-            [ -n "$DISCO_BOOT" ] && qm set $CURRENT_VMID --boot "order=$DISCO_BOOT"
-
-            mapfile -t PLACAS_REDE < <(qm config $CURRENT_VMID | grep -E '^net[0-9]+:' | awk -F: '{print $1}')
-            IFS=' ' read -r -a VLAN_ARRAY <<< "$VLANS_REQ"
-            for idx in "${!PLACAS_REDE[@]}"; do
-                placa="${PLACAS_REDE[$idx]}"
-                OLD_NET=$(qm config $CURRENT_VMID | grep "^${placa}:" | sed "s/^${placa}: //")
-                MAC=$(echo "$OLD_NET" | grep -o -i -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
-                NET_CONFIG="virtio=${MAC:-},bridge=vmbr0"
-                [ -n "${VLAN_ARRAY[$idx]}" ] && NET_CONFIG="$NET_CONFIG,tag=${VLAN_ARRAY[$idx]}"
-                qm set $CURRENT_VMID --$placa "$NET_CONFIG"
-            done
-        fi
+handle_interrupt() {
+    echo ""
+    log "⛔ INTERRUPÇÃO DETECTADA (Ctrl+C ou Erro)."
+    rollback
+    echo "----------------------------------------------------------"
+    read -p "Pressione ENTER para retornar ao Menu Principal ou digite 'q' para sair: " ans
+    if [[ "$ans" == "q" || "$ans" == "Q" ]]; then
+        rm -rf "$TEMP_DIR"
+        exit 1
     else
-        MEM=$(grep -iE '^memSize' "$caminho_vm" | cut -d'"' -f2 | tr -d '\r')
-        CORES=$(grep -iE '^numvcpus' "$caminho_vm" | cut -d'"' -f2 | tr -d '\r')
-        qm create $CURRENT_VMID --name "$NOME_LIMPO" --memory "${MEM:-2048}" --sockets 1 --cores "${CORES:-1}" --cpu host --scsihw virtio-scsi-single --vga virtio --agent 1 --onboot 1
+        main_menu
+    fi
+}
+trap 'handle_interrupt' SIGINT SIGTERM
+
+# ==============================================================================
+# Gerenciamento de Cron Jobs Existentes no Crontab do Usuário
+# ==============================================================================
+manage_existing_crons() {
+    clear
+    echo "=========================================================="
+    echo " GERENCIADOR DE AGENDAMENTOS (CRONTAB)"
+    echo "=========================================================="
+    
+    mapfile -t EXISTING_JOBS < <(crontab -l 2>/dev/null | grep "pve_export_")
+    
+    if [ ${#EXISTING_JOBS[@]} -gt 0 ]; then
+        echo "Agendamentos ativos encontrados na fila:"
+        local idx=1
+        for job in "${EXISTING_JOBS[@]}"; do
+            echo "[$idx] $job"
+            ((idx++))
+        done
         
-        EXIT_CODE=0
-        while read -r line; do
-            dev=$(echo "$line" | cut -d'.' -f1)
-            bus=$(echo "$dev" | cut -d':' -f1)
-            vmdk_name=$(echo "$line" | cut -d'"' -f2 | tr -d '\r')
-            vmdk_path="$(dirname "$caminho_vm")/$vmdk_name"
-            
-            qm importdisk $CURRENT_VMID "$vmdk_path" "$STORAGE_DESTINO" --format raw > /tmp/imp_${CURRENT_VMID}.log 2>&1
-            VOL=$(grep -o "$STORAGE_DESTINO:vm-$CURRENT_VMID-disk-[0-9]*" /tmp/imp_${CURRENT_VMID}.log | head -n 1)
-            if [ -n "$VOL" ]; then
-                qm set $CURRENT_VMID --$bus "$VOL"
-                [ "$bus" == "scsi0" ] && qm set $CURRENT_VMID --boot "order=$bus"
-            else
-                EXIT_CODE=1
+        echo "----------------------------------------------------------"
+        read -p "Deseja remover algum? (Digite o NÚMERO, 'TODOS' ou Enter para ignorar): " REMOVE_OPT
+        
+        if [ -n "$REMOVE_OPT" ]; then
+            if [[ "${REMOVE_OPT^^}" == "TODOS" ]]; then
+                crontab -l 2>/dev/null | grep -v "pve_export_" | crontab -
+                echo "[v] Todos os agendamentos de exportação foram removidos."
+                sleep 2
+            elif [[ "$REMOVE_OPT" =~ ^[0-9]+$ ]] && [ "$REMOVE_OPT" -le "${#EXISTING_JOBS[@]}" ]; then
+                JOB_TO_REMOVE="${EXISTING_JOBS[$((REMOVE_OPT-1))]}"
+                ESCAPED_JOB=$(echo "$JOB_TO_REMOVE" | sed 's/[][\.^$*]/\\&/g')
+                crontab -l 2>/dev/null | grep -v "$ESCAPED_JOB" | crontab -
+                echo "[v] Agendamento $REMOVE_OPT removido."
+                sleep 2
             fi
-        done < <(grep -i '\.fileName' "$caminho_vm" | grep -i '\.vmdk' | tr -d '\r')
-
-        IFS=' ' read -r -a VLAN_ARRAY <<< "$VLANS_REQ"
-        net_idx=0
-        while read -r eth_line; do
-            eth_prefix=$(echo "$eth_line" | awk -F'.' '{print $1}')
-            mac=$(grep -i "^${eth_prefix}.generatedAddress" "$caminho_vm" | cut -d'"' -f2 | tr -d '\r')
-            [ -z "$mac" ] && mac=$(grep -i "^${eth_prefix}.address " "$caminho_vm" | cut -d'"' -f2 | tr -d '\r')
-            NET_CONFIG="virtio,bridge=vmbr0"
-            [ -n "$mac" ] && NET_CONFIG="virtio=${mac},bridge=vmbr0"
-            [ -n "${VLAN_ARRAY[$net_idx]}" ] && NET_CONFIG="$NET_CONFIG,tag=${VLAN_ARRAY[$net_idx]}"
-            qm set $CURRENT_VMID --net${net_idx} "$NET_CONFIG"
-            ((net_idx++))
-        done < <(grep -iE '^ethernet[0-9]+\.present.*=.*"TRUE"' "$caminho_vm" | tr -d '\r')
-    fi
-
-    if [ $EXIT_CODE -eq 0 ]; then
-        if [ "$OPT_INJECT" == "1" ]; then
-            for drive in $(qm config $CURRENT_VMID | grep 'media=cdrom' | awk -F: '{print $1}'); do qm set $CURRENT_VMID --delete "$drive"; done
-            qm set $CURRENT_VMID --ide2 local:iso/pos_install_esxi.iso,media=cdrom
         fi
-        if [ "$OPT_RELIGAR" == "1" ]; then ssh -o StrictHostKeyChecking=no "$ESXI_USER@$ESXI_HOST" "vim-cmd vmsvc/power.on $ESXI_VMID" > /dev/null; fi
-        if [ "$OPT_START" == "1" ]; then qm start $CURRENT_VMID; fi
-        log_msg "[v] VM $NOME_LIMPO concluída!"
     else
-        log_msg "[x] ERRO na VM $NOME_LIMPO."
+        echo "Nenhum agendamento ativo encontrado no Crontab."
+        echo "----------------------------------------------------------"
     fi
-    sleep 2
-done
+}
 
-if [ "$MODO_IMPORT" == "2" ]; then umount -f /mnt/esxi_sshfs &>/dev/null; fi
+ask_execution_mode() {
+    echo ""
+    read -p "Deseja gerar um agendamento (Crontab) para execução autônoma? (s/N): " cron_ans
+    if [[ "$cron_ans" == "s" || "$cron_ans" == "S" ]]; then
+        IS_CRON_MODE=1
+        log "Modo selecionado: CRIAÇÃO DE AGENDAMENTO (Wizard)."
+    else
+        IS_CRON_MODE=0
+        log "Modo selecionado: EXECUÇÃO INTERATIVA."
+    fi
+}
 
-# --- ROTINA DE AUTODESTRUIÇÃO ---
-if [ "$IS_RECURRING" == "0" ]; then
-    log_msg "Lote finalizado. Removendo este agendamento unico do Crontab..."
-    crontab -l 2>/dev/null | grep -v "$MY_SCRIPT_PATH" | crontab -
-else
-    log_msg "Lote finalizado. Agendamento mantido (Recorrente)."
-fi
+ask_credentials() {
+    if [[ -z "$TARGET_IP" ]]; then
+        echo ""
+        read -p "IP do Servidor Destino: " TARGET_IP
+        read -p "Usuário SSH (ex: root): " TARGET_USER
+        read -s -p "Senha SSH: " TARGET_PASS
+        echo ""
+        log "Testando conectividade..."
+        if sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "exit" &>/dev/null; then
+            log "✅ Conexão SSH estabelecida."
+        else
+            log "❌ Falha na conexão. Abortando."
+            exit 1
+        fi
+    fi
+}
+
+# ==============================================================================
+# Helpers de Automação (Origem e Destino)
+# ==============================================================================
+get_source_vms() {
+    log "Mapeando VMs locais..."
+    local vms=$(qm list | awk 'NR>1 {print $1, $2, $3}')
+    local count=1
+    declare -A vm_map
+    echo -e "ID\tVMID\tNOME\t\tSTATUS"
+    while read -r vmid name status; do
+        echo -e "[$count]\t$vmid\t$name\t\t$status"
+        vm_map[$count]="$vmid"
+        ((count++))
+    done <<< "$vms"
+    echo ""
+    read -p "Selecione as VMs a processar (separe por espaço, ex: 1 3): " vm_selections
+    SELECTED_VMS=()
+    for sel in $vm_selections; do
+        if [[ -n "${vm_map[$sel]}" ]]; then SELECTED_VMS+=("${vm_map[$sel]}"); fi
+    done
+    if [ ${#SELECTED_VMS[@]} -eq 0 ]; then
+        log "Nenhuma VM válida. Retornando..."
+        handle_interrupt
+    fi
+}
+
+get_local_storage_for_backup() {
+    log "Mapeando storages locais com suporte a backup (vzdump)..."
+    local storages=$(pvesm status -content backup | awk 'NR>1 {print $1, $2, $4}')
+    local count=1
+    declare -A st_map
+    echo -e "ID\tNOME_ORIGEM\tTIPO\tLIVRE"
+    while read -r name type free_bytes; do
+        local free_gb=$((free_bytes / 1024 / 1024 / 1024))
+        echo -e "[$count]\t$name\t\t$type\t${free_gb}GB"
+        st_map[$count]="$name|$free_gb"
+        ((count++))
+    done <<< "$storages"
+    echo ""
+    read -p "Selecione o storage para o backup temporário: " st_sel
+    local sel_data=${st_map[$st_sel]}
+    if [[ -z "$sel_data" ]]; then handle_interrupt; fi
+    LOCAL_STORAGE_NAME=$(echo "$sel_data" | cut -d'|' -f1)
+    log "Selecionado: $LOCAL_STORAGE_NAME"
+}
+
+get_target_storages() {
+    log "Mapeando storages no destino ($TARGET_IP)..."
+    local storages=$(sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "pvesm status -content images | awk 'NR>1 {print \$1, \$2, \$4}'")
+    local count=1
+    declare -A st_map
+    echo -e "ID\tNOME_DESTINO\tTIPO\tLIVRE"
+    while read -r name type free_bytes; do
+        local free_gb=$((free_bytes / 1024 / 1024 / 1024))
+        echo -e "[$count]\t$name\t\t$type\t${free_gb}GB"
+        st_map[$count]="$name"
+        ((count++))
+    done <<< "$storages"
+    echo ""
+    read -p "Selecione o storage remoto para restaurar as VMs: " st_sel
+    TARGET_STORAGE=${st_map[$st_sel]}
+    if [[ -z "$TARGET_STORAGE" ]]; then handle_interrupt; fi
+    log "Selecionado remoto: $TARGET_STORAGE"
+}
+
+# ==============================================================================
+# Validação e Injeção de Chave SSH Otimizada
+# ==============================================================================
+setup_ssh_keys() {
+    log "Validando comunicação via Chaves SSH..."
+    KEY_PATH="$HOME/.ssh/id_ed25519"
+    
+    if [[ ! -f "$KEY_PATH" ]]; then 
+        log "Gerando novo par de chaves ED25519..."
+        ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -q
+    fi
+
+    if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${TARGET_USER}@${TARGET_IP} "exit" &>/dev/null; then
+        log "Confiança SSH já estabelecida com $TARGET_IP. Injeção ignorada."
+    else
+        log "Injetando chave pública no destino $TARGET_IP..."
+        sshpass -p "$TARGET_PASS" ssh-copy-id -o StrictHostKeyChecking=no -i "$KEY_PATH.pub" ${TARGET_USER}@${TARGET_IP} >/dev/null 2>&1
+        log "Chave SSH autorizada."
+    fi
+}
+
+# ==============================================================================
+# Execução Lógica (Backup SCP / Pipe)
+# ==============================================================================
+execute_backup_scp() {
+    get_source_vms
+    get_local_storage_for_backup
+    get_target_storages
+
+    if [[ $IS_CRON_MODE -eq 1 ]]; then
+        generate_cron_script "scp"
+        return
+    fi
+
+    for SRC_VMID in "${SELECTED_VMS[@]}"; do
+        ACTION_IN_PROGRESS=1
+        CURRENT_TARGET_VMID=$(sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "pvesh get /cluster/nextid")
+        
+        log "--------------------------------------------------------"
+        log "Iniciando Backup Local da VM $SRC_VMID..."
+        if ! vzdump $SRC_VMID --storage $LOCAL_STORAGE_NAME --compress zstd --mode snapshot > "$TEMP_DIR/dump.log" 2>&1; then
+            log "❌ Falha no vzdump."
+            cat "$TEMP_DIR/dump.log" >> "$LOG_FILE"
+            handle_interrupt
+        fi
+        
+        TEMP_BACKUP_FILE=$(grep "creating archive" "$TEMP_DIR/dump.log" | awk -F"'" '{print $2}')
+        log "✅ Backup gerado: $TEMP_BACKUP_FILE. Transferindo..."
+
+        sshpass -p "$TARGET_PASS" rsync -a --info=progress2 "$TEMP_BACKUP_FILE" ${TARGET_USER}@${TARGET_IP}:/var/lib/vz/dump/ | while read line; do
+            echo -ne "$line\r"
+            if [[ "$line" =~ (10%|20%|30%|40%|50%|60%|70%|80%|90%|100%) ]]; then
+                echo "[Rsync] $line" >> "$LOG_FILE"
+            fi
+        done
+        echo ""
+
+        REMOTE_FILE="/var/lib/vz/dump/$(basename "$TEMP_BACKUP_FILE")"
+        log "Restaurando $REMOTE_FILE no destino como ID $CURRENT_TARGET_VMID..."
+        
+        if ! sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qmrestore $REMOTE_FILE $CURRENT_TARGET_VMID --storage $TARGET_STORAGE"; then
+            log "❌ Falha no qmrestore remoto."
+            handle_interrupt
+        fi
+
+        log "Limpando artefatos..."
+        rm -f "$TEMP_BACKUP_FILE"
+        sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "rm -f $REMOTE_FILE"
+        ACTION_IN_PROGRESS=0
+        log "🎉 VM $SRC_VMID exportada com sucesso."
+    done
+}
+
+execute_direct_pipe() {
+    get_source_vms
+    get_target_storages
+
+    if [[ $IS_CRON_MODE -eq 1 ]]; then
+        generate_cron_script "pipe"
+        return
+    fi
+
+    for SRC_VMID in "${SELECTED_VMS[@]}"; do
+        ACTION_IN_PROGRESS=1
+        CURRENT_TARGET_VMID=$(sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "pvesh get /cluster/nextid")
+        
+        log "--------------------------------------------------------"
+        log "Iniciando Pipe Direto: VM $SRC_VMID -> Destino ID $CURRENT_TARGET_VMID..."
+        
+        vzdump $SRC_VMID --stdout --mode snapshot 2>>"$LOG_FILE" | pv -pteb | sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "qmrestore - $CURRENT_TARGET_VMID --storage $TARGET_STORAGE"
+        local STATUS=("${PIPESTATUS[@]}")
+        
+        if [[ ${STATUS[0]} -eq 0 && ${STATUS[2]} -eq 0 ]]; then
+            log "🎉 VM $SRC_VMID exportada com sucesso."
+        else
+            log "❌ Erro no Pipe. vzdump=${STATUS[0]}, pv=${STATUS[1]}, ssh=${STATUS[2]}"
+            handle_interrupt
+        fi
+        ACTION_IN_PROGRESS=0
+    done
+}
+
+# ==============================================================================
+# Geração de Agendamento (Crontab do Usuário)
+# ==============================================================================
+generate_cron_script() {
+    local METHOD=$1
+    echo "=========================================================="
+    echo " CONFIGURAÇÃO DE AGENDAMENTO SIMPLIFICADA"
+    echo "=========================================================="
+    
+    local CRON_MIN=""
+    local CRON_HR=""
+    local CRON_DOM=""
+    local CRON_MON=""
+    local CRON_DOW=""
+    local RUN_ONCE="n"
+    
+    read -p "Digite o horário de execução (HH:MM, ex: 03:30): " EXEC_TIME
+    CRON_HR=$(echo "$EXEC_TIME" | cut -d: -f1)
+    CRON_MIN=$(echo "$EXEC_TIME" | cut -d: -f2)
+    
+    read -p "A execução será recorrente? (s/N) [Padrão: n]: " IS_RECURRING
+    IS_RECURRING=${IS_RECURRING:-n}
+    
+    if [[ "$IS_RECURRING" == "n" || "$IS_RECURRING" == "N" ]]; then
+        RUN_ONCE="s"
+        log "Cron Wizard: Execução ÚNICA selecionada."
+        echo "1) Hoje"
+        echo "2) Amanhã"
+        echo "3) Data Específica"
+        read -p "Selecione o dia da execução: " DIA_OPCAO
+        
+        case $DIA_OPCAO in
+            1) 
+                CRON_DOM=$(date +%d)
+                CRON_MON=$(date +%m)
+                log "Cron Wizard: Execução agendada para HOJE ($CRON_DOM/$CRON_MON) às $EXEC_TIME"
+                ;;
+            2)
+                CRON_DOM=$(date -d "tomorrow" +%d)
+                CRON_MON=$(date -d "tomorrow" +%m)
+                log "Cron Wizard: Execução agendada para AMANHÃ ($CRON_DOM/$CRON_MON) às $EXEC_TIME"
+                ;;
+            3)
+                read -p "Digite a data (DD/MM, ex: 25/12): " EXEC_DATE
+                CRON_DOM=$(echo "$EXEC_DATE" | cut -d/ -f1)
+                CRON_MON=$(echo "$EXEC_DATE" | cut -d/ -f2)
+                log "Cron Wizard: Execução agendada para DATA ESPECÍFICA ($CRON_DOM/$CRON_MON) às $EXEC_TIME"
+                ;;
+            *) echo "Opção inválida."; handle_interrupt ;;
+        esac
+    else
+        RUN_ONCE="n"
+        log "Cron Wizard: Execução RECORRENTE selecionada."
+        echo "1) Todos os dias"
+        echo "2) Dias da semana específicos"
+        echo "3) Dias do mês específicos"
+        read -p "Selecione a frequência: " FREQ_OPCAO
+        
+        case $FREQ_OPCAO in
+            1) log "Cron Wizard: Frequência TODOS OS DIAS às $EXEC_TIME" ;;
+            2)
+                echo "0=Dom, 1=Seg, 2=Ter, 3=Qua, 4=Qui, 5=Sex, 6=Sáb"
+                read -p "Digite os números separados por vírgula (ex: 1,3,5): " CRON_DOW
+                log "Cron Wizard: Frequência DIAS DA SEMANA [$CRON_DOW] às $EXEC_TIME"
+                ;;
+            3)
+                read -p "Digite os dias do mês separados por vírgula (ex: 1,15,30): " CRON_DOM
+                log "Cron Wizard: Frequência DIAS DO MÊS [$CRON_DOM] às $EXEC_TIME"
+                ;;
+            *) echo "Opção inválida."; handle_interrupt ;;
+        esac
+    fi
+
+    # Configura chaves SSH blindadas
+    setup_ssh_keys
+
+    JOB_NAME="pve_export_${TIMESTAMP}"
+    JOB_SCRIPT="/usr/local/bin/${JOB_NAME}.sh"
+    JOB_LOG="/var/log/${JOB_NAME}.log"
+
+    # Criação do Script Autônomo
+    cat << 'EOF' > "$JOB_SCRIPT"
+#!/usr/bin/env bash
 EOF
+    echo "TARGET_IP=\"$TARGET_IP\"" >> "$JOB_SCRIPT"
+    echo "TARGET_USER=\"$TARGET_USER\"" >> "$JOB_SCRIPT"
+    echo "TARGET_STORAGE=\"$TARGET_STORAGE\"" >> "$JOB_SCRIPT"
+    echo "LOCAL_STORAGE_NAME=\"$LOCAL_STORAGE_NAME\"" >> "$JOB_SCRIPT"
+    echo "JOB_LOG=\"$JOB_LOG\"" >> "$JOB_SCRIPT"
+    echo "VMS_ARRAY=(${SELECTED_VMS[@]})" >> "$JOB_SCRIPT"
 
-chmod +x "$SCRIPT_DESTINO"
-echo "[v] Script gerado em $SCRIPT_DESTINO"
+    if [[ "$METHOD" == "pipe" ]]; then
+        cat << 'EOF' >> "$JOB_SCRIPT"
+log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$JOB_LOG"; }
+for SRC_VMID in "${VMS_ARRAY[@]}"; do
+    TARGET_VMID=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "pvesh get /cluster/nextid")
+    log "Executando Pipe: VM $SRC_VMID para novo ID $TARGET_VMID..."
+    vzdump $SRC_VMID --stdout --mode snapshot 2>>"$JOB_LOG" | ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "qmrestore - $TARGET_VMID --storage $TARGET_STORAGE"
+    STATUS=("${PIPESTATUS[@]}")
+    if [[ ${STATUS[0]} -ne 0 || ${STATUS[1]} -ne 0 ]]; then
+        log "ERRO: Desfazendo VM $TARGET_VMID"
+        ssh -o BatchMode=yes ${TARGET_USER}@${TARGET_IP} "qm destroy $TARGET_VMID --purge 1 || true"
+    fi
+done
+EOF
+    elif [[ "$METHOD" == "scp" ]]; then
+        cat << 'EOF' >> "$JOB_SCRIPT"
+log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$JOB_LOG"; }
+for SRC_VMID in "${VMS_ARRAY[@]}"; do
+    TARGET_VMID=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "pvesh get /cluster/nextid")
+    log "Gerando Backup local da VM $SRC_VMID..."
+    vzdump $SRC_VMID --storage $LOCAL_STORAGE_NAME --compress zstd --mode snapshot > /tmp/cron_dump.log 2>&1
+    TEMP_FILE=$(grep "creating archive" /tmp/cron_dump.log | awk -F"'" '{print $2}')
+    REMOTE_FILE="/var/lib/vz/dump/$(basename "$TEMP_FILE")"
+    log "Transferindo e restaurando como ID $TARGET_VMID..."
+    rsync -a "$TEMP_FILE" ${TARGET_USER}@${TARGET_IP}:/var/lib/vz/dump/
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "qmrestore $REMOTE_FILE $TARGET_VMID --storage $TARGET_STORAGE"
+    rm -f "$TEMP_FILE"
+    ssh -o BatchMode=yes ${TARGET_USER}@${TARGET_IP} "rm -f $REMOTE_FILE"
+done
+EOF
+    fi
 
-# --- 6. AGENDAMENTO NO CRONTAB ---
-if [ "$OPT_CRON" == "1" ]; then
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_DESTINO" > /tmp/crontmp
-    echo "$CRON_M $CRON_H $CRON_D $CRON_MON * $SCRIPT_DESTINO > /dev/null 2>&1" >> /tmp/crontmp
+    # Lógica de Autodestruição via Crontab e deleção do arquivo
+    if [[ "$RUN_ONCE" == "s" || "$RUN_ONCE" == "S" ]]; then
+        cat << EOF >> "$JOB_SCRIPT"
+log "Autodestruindo agendamento único..."
+crontab -l 2>/dev/null | grep -v "$JOB_SCRIPT" | crontab -
+rm -f "\$0"
+EOF
+    fi
+
+    chmod +x "$JOB_SCRIPT"
+    
+    # Tratamento final das variáveis Cron para evitar quebra de sintaxe
+    # Transforma vazios em '*' e remove eventuais zeros à esquerda indesejados (ex: 08)
+    CRON_DOM=$(echo "${CRON_DOM:-*}" | sed 's/^0*//')
+    CRON_MON=$(echo "${CRON_MON:-*}" | sed 's/^0*//')
+    CRON_DOW=${CRON_DOW:-*}
+    CRON_HR=$(echo "${CRON_HR:-*}" | sed 's/^0*//')
+    CRON_MIN=$(echo "${CRON_MIN:-*}" | sed 's/^0*//')
+    
+    [[ -z "$CRON_DOM" ]] && CRON_DOM="*"
+    [[ -z "$CRON_MON" ]] && CRON_MON="*"
+    [[ -z "$CRON_HR" ]] && CRON_HR="0"
+    [[ -z "$CRON_MIN" ]] && CRON_MIN="0"
+
+    # Injeta no Crontab do usuário
+    crontab -l 2>/dev/null | grep -v "$JOB_SCRIPT" > /tmp/crontmp
+    echo "$CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW $JOB_SCRIPT > /dev/null 2>&1" >> /tmp/crontmp
     crontab /tmp/crontmp
     rm /tmp/crontmp
     
-    DATA_NOME="${CRON_D}/${CRON_MON}"
-    [ "$TIPO_DATA" == "4" ] && DATA_NOME="Diario"
-    echo -e "\n======================================================"
-    echo "[v] AGENDAMENTO CRIADO COM SUCESSO"
-    echo "    Data: $DATA_NOME às $CRON_H:$CRON_M"
-    echo "    Script Gerado: $SCRIPT_DESTINO"
-    echo "======================================================"
-    echo ">>> PARA MONITORAR A EXECUÇÃO EM TEMPO REAL NO HORÁRIO AGENDADO, RODE O COMANDO ABAIXO:"
-    echo "tail -f $EXEC_LOG"
-    echo "======================================================"
+    log "✅ AGENDAMENTO CRIADO COM SUCESSO."
+    log "Sintaxe Cron Aplicada: $CRON_MIN $CRON_HR $CRON_DOM $CRON_MON $CRON_DOW"
+    log ">>> Para monitorar na hora agendada: tail -f $JOB_LOG"
     
-    log_w "Novo script engatilhado no cron: $SCRIPT_DESTINO (Data: $DATA_NOME $CRON_H:$CRON_M)"
-fi
+    echo ""
+    read -p "Pressione ENTER para voltar ao menu..."
+}
+
+# ==============================================================================
+# Menu Principal
+# ==============================================================================
+main_menu() {
+    while true; do
+        clear
+        echo "=========================================================="
+        echo " MIGRATOR & EXPORTER PROXMOX"
+        echo "=========================================================="
+        echo "Arquivo de Log: $LOG_FILE"
+        echo "Modo Atual: $( [[ $IS_CRON_MODE -eq 1 ]] && echo 'AGENDAMENTO (Gerar Cron)' || echo 'EXECUÇÃO IMEDIATA' )"
+        echo "----------------------------------------------------------"
+        echo "1) Exportação: SSH Backup & Restore (Seguro, gera arquivo local, transfere e restaura)"
+        echo "2) Exportação: SSH Pipe Direto (Streaming direto para o destino, sem uso de disco)"
+        echo "3) Replicação ZFS (ZFS Send/Receive - *Stub*)"
+        echo "4) Migração Nativa (Cluster Proxmox - *Stub*)"
+        echo "5) Backups Locais/Remotos/USB (*Stub*)"
+        echo "0) Sair"
+        echo ""
+        read -p "Selecione o método de execução: " OPTION
+        
+        case $OPTION in
+            1) ask_credentials; execute_backup_scp ;;
+            2) ask_credentials; execute_direct_pipe ;;
+            3|4|5) echo "Em desenvolvimento. Retornando..."; sleep 1 ;;
+            0) rm -rf "$TEMP_DIR"; exit 0 ;;
+            *) echo "Opção inválida."; sleep 1 ;;
+        esac
+    done
+}
+
+# Boot Flow
+manage_existing_crons
+ask_execution_mode
+main_menu
