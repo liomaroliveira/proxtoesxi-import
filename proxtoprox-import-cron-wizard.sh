@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Proxmox VM Exporter & Migrator - V10
+# Proxmox VM Exporter & Migrator - V11
 # ==============================================================================
 
 set -eE -o pipefail
@@ -142,7 +142,7 @@ manage_existing_crons() {
 
             if [[ -f "$script_file" ]]; then
                 t_ip=$(grep '^TARGET_IP=' "$script_file" | cut -d'"' -f2 || echo "N/A")
-                [[ -z "$t_ip" ]] && t_ip="LOCAL (Backup)" # Ajuste visual se não for envio remoto
+                [[ -z "$t_ip" ]] && t_ip="LOCAL (Backup)"
                 t_vms=$(grep '^VMS_NAMES_STR=' "$script_file" | cut -d'"' -f2 || echo "")
                 
                 if [[ -z "$t_vms" ]]; then
@@ -247,12 +247,13 @@ get_source_vms() {
 
 get_local_storage_for_backup() {
     log "Mapeando storages configurados no Proxmox com suporte a backup..."
-    local storages=$(pvesm status -content backup | awk 'NR>1 {print $1, $2, $4}')
+    # Coluna $6 = Available (em KB)
+    local storages=$(pvesm status -content backup | awk 'NR>1 {print $1, $2, $6}')
     local count=1
     declare -A st_map
     echo -e "ID\tNOME_STORAGE\tTIPO\tLIVRE"
-    while read -r name type free_bytes; do
-        local free_gb=$((free_bytes / 1024 / 1024 / 1024))
+    while read -r name type free_kb; do
+        local free_gb=$((free_kb / 1024 / 1024))
         echo -e "[$count]\t$name\t\t$type\t${free_gb}GB"
         st_map[$count]="$name|$free_gb"
         ((count++))
@@ -268,12 +269,13 @@ get_local_storage_for_backup() {
 
 get_target_storages() {
     log "Mapeando storages no destino ($TARGET_IP)..."
-    local storages=$(sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "pvesm status -content images | awk 'NR>1 {print \$1, \$2, \$4}'")
+    # Coluna $6 = Available (em KB)
+    local storages=$(sshpass -p "$TARGET_PASS" ssh $SSH_OPTS ${TARGET_USER}@${TARGET_IP} "pvesm status -content images | awk 'NR>1 {print \$1, \$2, \$6}'")
     local count=1
     declare -A st_map
     echo -e "ID\tNOME_DESTINO\tTIPO\tLIVRE"
-    while read -r name type free_bytes; do
-        local free_gb=$((free_bytes / 1024 / 1024 / 1024))
+    while read -r name type free_kb; do
+        local free_gb=$((free_kb / 1024 / 1024))
         echo -e "[$count]\t$name\t\t$type\t${free_gb}GB"
         st_map[$count]="$name"
         ((count++))
@@ -320,7 +322,6 @@ execute_native_backup() {
         log "--------------------------------------------------------"
         log "Iniciando Backup Nativo da VM $SRC_VMID para o storage $LOCAL_STORAGE_NAME..."
         
-        # Modo interativo: exibe stdout para acompanhamento do progresso do vzdump (ou PBS client)
         set +e
         vzdump $SRC_VMID --storage $LOCAL_STORAGE_NAME --mode snapshot --compress zstd 2>&1 | tee -a "$LOG_FILE"
         local DUMP_STATUS=${PIPESTATUS[0]}
@@ -499,7 +500,6 @@ generate_cron_script() {
         esac
     fi
 
-    # Só valida SSH se o método envolver transferência remota
     if [[ "$METHOD" != "native_backup" ]]; then
         setup_ssh_keys
     fi
