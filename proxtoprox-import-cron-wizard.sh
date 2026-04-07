@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Proxmox VM Exporter & Migrator - V8
+# Proxmox VM Exporter & Migrator - V9
 # ==============================================================================
 
 set -eE -o pipefail
@@ -73,7 +73,7 @@ handle_interrupt() {
     echo ""
     log "⛔ INTERRUPÇÃO DETECTADA."
     rollback
-    echo "----------------------------------------------------------"
+    echo "--------------------------------------------------------------------------------"
     read -p "Pressione ENTER para retornar ao Menu Principal ou digite 'q' para sair: " ans
     if [[ "$ans" == "q" || "$ans" == "Q" ]]; then
         rm -rf "$TEMP_DIR"
@@ -91,9 +91,9 @@ trap 'handle_interrupt' SIGINT SIGTERM
 # ==============================================================================
 manage_existing_crons() {
     clear
-    echo "================================================================================"
+    echo "=================================================================================================="
     echo " GERENCIADOR DE AGENDAMENTOS (/etc/cron.d/)"
-    echo "================================================================================"
+    echo "=================================================================================================="
     
     local cron_files=(/etc/cron.d/pve_export_*)
     
@@ -102,35 +102,70 @@ manage_existing_crons() {
         local count=1
         declare -A cron_map
         
-        # Cabeçalho da Tabela Alinhada
-        printf "%-5s | %-28s | %-15s | %s\n" "ID" "ARQUIVO" "DESTINO (IP)" "VMs (FILA)"
-        echo "--------------------------------------------------------------------------------"
+        printf "%-4s | %-17s | %-17s | %-14s | %s\n" "ID" "AGENDAMENTO" "ID ARQUIVO" "DESTINO (IP)" "VMs (ID:NOME)"
+        echo "--------------------------------------------------------------------------------------------------"
         
         for file in "${cron_files[@]}"; do
             local base_name=$(basename "$file")
+            local short_name=$(echo "$base_name" | sed 's/pve_export_//')
             local script_file="/usr/local/bin/${base_name}.sh"
             local t_ip="N/A"
             local t_vms="N/A"
+            local schedule="Erro Leitura"
 
-            # Parseia os dados diretamente do script agendado
-            if [[ -f "$script_file" ]]; then
-                t_ip=$(grep '^TARGET_IP=' "$script_file" | cut -d'"' -f2 || echo "N/A")
-                t_vms=$(grep '^VMS_ARRAY=' "$script_file" | cut -d'(' -f2 | cut -d')' -f1 || echo "N/A")
+            # 1. Lê e traduz o horário do próprio arquivo Cron
+            if [[ -f "$file" ]]; then
+                local cron_line=$(grep -v '^\s*#' "$file" | grep -v '^\s*$' | head -n 1)
+                if [[ -n "$cron_line" ]]; then
+                    local c_min=$(echo "$cron_line" | awk '{print $1}')
+                    local c_hr=$(echo "$cron_line" | awk '{print $2}')
+                    local c_dom=$(echo "$cron_line" | awk '{print $3}')
+                    local c_mon=$(echo "$cron_line" | awk '{print $4}')
+                    local c_dow=$(echo "$cron_line" | awk '{print $5}')
+                    
+                    local freq=""
+                    if [[ "$c_dom" == "*" && "$c_mon" == "*" && "$c_dow" == "*" ]]; then
+                        freq="Diário"
+                    elif [[ "$c_dow" != "*" ]]; then
+                        freq="Semanal(D:$c_dow)"
+                    else
+                        freq="$c_dom/$c_mon"
+                    fi
+                    
+                    # Formatação visual (0 vira 00)
+                    [[ ${#c_hr} -eq 1 ]] && c_hr="0${c_hr}"
+                    [[ ${#c_min} -eq 1 ]] && c_min="0${c_min}"
+                    [[ "$c_hr" == "*" ]] && c_hr="**"
+                    [[ "$c_min" == "*" ]] && c_min="**"
+                    
+                    schedule="${c_hr}:${c_min} ($freq)"
+                fi
             fi
 
-            printf "[%-3d] | %-28s | %-15s | %s\n" "$count" "$base_name" "$t_ip" "$t_vms"
+            # 2. Parseia o IP e os Nomes das VMs no script bash secundário
+            if [[ -f "$script_file" ]]; then
+                t_ip=$(grep '^TARGET_IP=' "$script_file" | cut -d'"' -f2 || echo "N/A")
+                t_vms=$(grep '^VMS_NAMES_STR=' "$script_file" | cut -d'"' -f2 || echo "")
+                
+                # Fallback para scripts criados em versões anteriores (V8 e abaixo)
+                if [[ -z "$t_vms" ]]; then
+                    t_vms=$(grep '^VMS_ARRAY=' "$script_file" | cut -d'(' -f2 | cut -d')' -f1 || echo "N/A")
+                fi
+            fi
+
+            printf "[%-2d] | %-17s | %-17s | %-14s | %s\n" "$count" "$schedule" "$short_name" "$t_ip" "$t_vms"
             cron_map[$count]="$file"
             ((count++))
         done
         
-        echo "--------------------------------------------------------------------------------"
+        echo "--------------------------------------------------------------------------------------------------"
         read -p "Deseja remover algum? (Digite o NÚMERO, 'TODOS' ou Enter para ignorar): " REMOVE_OPT
         
         if [ -n "$REMOVE_OPT" ]; then
             if [[ "${REMOVE_OPT^^}" == "TODOS" ]]; then
                 rm -f /etc/cron.d/pve_export_*
                 rm -f /usr/local/bin/pve_export_*.sh
-                echo "[v] Todos os agendamentos e scripts executáveis removidos."
+                echo "[v] Todos os agendamentos e executáveis removidos."
                 sleep 2
             elif [[ -n "${cron_map[$REMOVE_OPT]}" ]]; then
                 local target_cron="${cron_map[$REMOVE_OPT]}"
@@ -144,7 +179,7 @@ manage_existing_crons() {
         fi
     else
         echo "Nenhum agendamento ativo encontrado."
-        echo "--------------------------------------------------------------------------------"
+        echo "--------------------------------------------------------------------------------------------------"
     fi
 }
 
@@ -185,18 +220,28 @@ get_source_vms() {
     local vms=$(qm list | awk 'NR>1 {print $1, $2, $3}')
     local count=1
     declare -A vm_map
+    declare -A vm_name_map
+    
     echo -e "ID\tVMID\tNOME\t\tSTATUS"
     while read -r vmid name status; do
         echo -e "[$count]\t$vmid\t$name\t\t$status"
         vm_map[$count]="$vmid"
+        vm_name_map[$vmid]="$name"
         ((count++))
     done <<< "$vms"
     echo ""
     read -p "Selecione as VMs a processar (separe por espaço, ex: 1 3): " vm_selections
+    
     SELECTED_VMS=()
+    SELECTED_VMS_NAMES=()
     for sel in $vm_selections; do
-        if [[ -n "${vm_map[$sel]}" ]]; then SELECTED_VMS+=("${vm_map[$sel]}"); fi
+        if [[ -n "${vm_map[$sel]}" ]]; then 
+            local id="${vm_map[$sel]}"
+            SELECTED_VMS+=("$id")
+            SELECTED_VMS_NAMES+=("$id:${vm_name_map[$id]}")
+        fi
     done
+    
     if [ ${#SELECTED_VMS[@]} -eq 0 ]; then
         log "Nenhuma VM válida selecionada."
         handle_interrupt
@@ -358,9 +403,9 @@ execute_direct_pipe() {
 # ==============================================================================
 generate_cron_script() {
     local METHOD=$1
-    echo "================================================================================"
+    echo "=================================================================================================="
     echo " CONFIGURAÇÃO DE AGENDAMENTO SIMPLIFICADA"
-    echo "================================================================================"
+    echo "=================================================================================================="
     
     local CRON_MIN=""
     local CRON_HR=""
@@ -441,6 +486,7 @@ EOF
     echo "LOCAL_STORAGE_NAME=\"$LOCAL_STORAGE_NAME\"" >> "$JOB_SCRIPT"
     echo "JOB_LOG=\"$JOB_LOG\"" >> "$JOB_SCRIPT"
     echo "VMS_ARRAY=(${SELECTED_VMS[@]})" >> "$JOB_SCRIPT"
+    echo "VMS_NAMES_STR=\"${SELECTED_VMS_NAMES[*]}\"" >> "$JOB_SCRIPT"
 
     if [[ "$METHOD" == "pipe" ]]; then
         cat << 'EOF' >> "$JOB_SCRIPT"
@@ -515,12 +561,12 @@ EOF
 main_menu() {
     while true; do
         clear
-        echo "================================================================================"
+        echo "=================================================================================================="
         echo " MIGRATOR & EXPORTER PROXMOX"
-        echo "================================================================================"
+        echo "=================================================================================================="
         echo "Arquivo de Log: $LOG_FILE"
         echo "Modo Atual: $( [[ $IS_CRON_MODE -eq 1 ]] && echo 'AGENDAMENTO (Gerar Cron)' || echo 'EXECUÇÃO IMEDIATA' )"
-        echo "--------------------------------------------------------------------------------"
+        echo "--------------------------------------------------------------------------------------------------"
         echo "1) Exportação: SSH Backup & Restore (Seguro, gera arquivo local, transfere e restaura)"
         echo "2) Exportação: SSH Pipe Direto (Streaming direto para o destino, sem uso de disco)"
         echo "3) Replicação ZFS (ZFS Send/Receive - *Stub*)"
