@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Proxmox VM Exporter & Migrator - V9
+# Proxmox VM Exporter & Migrator - V10
 # ==============================================================================
 
 set -eE -o pipefail
@@ -113,7 +113,6 @@ manage_existing_crons() {
             local t_vms="N/A"
             local schedule="Erro Leitura"
 
-            # 1. Lê e traduz o horário do próprio arquivo Cron
             if [[ -f "$file" ]]; then
                 local cron_line=$(grep -v '^\s*#' "$file" | grep -v '^\s*$' | head -n 1)
                 if [[ -n "$cron_line" ]]; then
@@ -132,7 +131,6 @@ manage_existing_crons() {
                         freq="$c_dom/$c_mon"
                     fi
                     
-                    # Formatação visual (0 vira 00)
                     [[ ${#c_hr} -eq 1 ]] && c_hr="0${c_hr}"
                     [[ ${#c_min} -eq 1 ]] && c_min="0${c_min}"
                     [[ "$c_hr" == "*" ]] && c_hr="**"
@@ -142,12 +140,11 @@ manage_existing_crons() {
                 fi
             fi
 
-            # 2. Parseia o IP e os Nomes das VMs no script bash secundário
             if [[ -f "$script_file" ]]; then
                 t_ip=$(grep '^TARGET_IP=' "$script_file" | cut -d'"' -f2 || echo "N/A")
+                [[ -z "$t_ip" ]] && t_ip="LOCAL (Backup)" # Ajuste visual se não for envio remoto
                 t_vms=$(grep '^VMS_NAMES_STR=' "$script_file" | cut -d'"' -f2 || echo "")
                 
-                # Fallback para scripts criados em versões anteriores (V8 e abaixo)
                 if [[ -z "$t_vms" ]]; then
                     t_vms=$(grep '^VMS_ARRAY=' "$script_file" | cut -d'(' -f2 | cut -d')' -f1 || echo "N/A")
                 fi
@@ -249,11 +246,11 @@ get_source_vms() {
 }
 
 get_local_storage_for_backup() {
-    log "Mapeando storages locais com suporte a backup..."
+    log "Mapeando storages configurados no Proxmox com suporte a backup..."
     local storages=$(pvesm status -content backup | awk 'NR>1 {print $1, $2, $4}')
     local count=1
     declare -A st_map
-    echo -e "ID\tNOME_ORIGEM\tTIPO\tLIVRE"
+    echo -e "ID\tNOME_STORAGE\tTIPO\tLIVRE"
     while read -r name type free_bytes; do
         local free_gb=$((free_bytes / 1024 / 1024 / 1024))
         echo -e "[$count]\t$name\t\t$type\t${free_gb}GB"
@@ -261,11 +258,12 @@ get_local_storage_for_backup() {
         ((count++))
     done <<< "$storages"
     echo ""
-    read -p "Selecione o storage para o backup temporário: " st_sel
+    echo "Dica: Para backups USB, o pendrive deve estar montado e adicionado em Datacenter > Storage > Directory."
+    read -p "Selecione o storage de destino para o backup: " st_sel
     local sel_data=${st_map[$st_sel]}
     if [[ -z "$sel_data" ]]; then handle_interrupt; fi
     LOCAL_STORAGE_NAME=$(echo "$sel_data" | cut -d'|' -f1)
-    log "Selecionado: $LOCAL_STORAGE_NAME"
+    log "Storage selecionado: $LOCAL_STORAGE_NAME"
 }
 
 get_target_storages() {
@@ -306,8 +304,38 @@ setup_ssh_keys() {
 }
 
 # ==============================================================================
-# Execução Lógica (Backup SCP / Pipe)
+# Execução Lógica (Backup Local / SCP / Pipe)
 # ==============================================================================
+execute_native_backup() {
+    get_source_vms
+    get_local_storage_for_backup
+
+    if [[ $IS_CRON_MODE -eq 1 ]]; then
+        generate_cron_script "native_backup"
+        return
+    fi
+
+    for SRC_VMID in "${SELECTED_VMS[@]}"; do
+        ACTION_IN_PROGRESS=1
+        log "--------------------------------------------------------"
+        log "Iniciando Backup Nativo da VM $SRC_VMID para o storage $LOCAL_STORAGE_NAME..."
+        
+        # Modo interativo: exibe stdout para acompanhamento do progresso do vzdump (ou PBS client)
+        set +e
+        vzdump $SRC_VMID --storage $LOCAL_STORAGE_NAME --mode snapshot --compress zstd 2>&1 | tee -a "$LOG_FILE"
+        local DUMP_STATUS=${PIPESTATUS[0]}
+        set -e
+        
+        if [ $DUMP_STATUS -ne 0 ]; then
+            log "❌ Falha no vzdump da VM $SRC_VMID."
+            handle_interrupt
+        else
+            log "🎉 Backup da VM $SRC_VMID finalizado com sucesso no storage $LOCAL_STORAGE_NAME."
+        fi
+        ACTION_IN_PROGRESS=0
+    done
+}
+
 execute_backup_scp() {
     get_source_vms
     get_local_storage_for_backup
@@ -471,7 +499,10 @@ generate_cron_script() {
         esac
     fi
 
-    setup_ssh_keys
+    # Só valida SSH se o método envolver transferência remota
+    if [[ "$METHOD" != "native_backup" ]]; then
+        setup_ssh_keys
+    fi
 
     JOB_NAME="pve_export_${TIMESTAMP}"
     JOB_SCRIPT="/usr/local/bin/${JOB_NAME}.sh"
@@ -518,6 +549,14 @@ for SRC_VMID in "${VMS_ARRAY[@]}"; do
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_IP} "qmrestore $REMOTE_FILE $TARGET_VMID --storage $TARGET_STORAGE"
     rm -f "$TEMP_FILE"
     ssh -o BatchMode=yes ${TARGET_USER}@${TARGET_IP} "rm -f $REMOTE_FILE"
+done
+EOF
+    elif [[ "$METHOD" == "native_backup" ]]; then
+        cat << 'EOF' >> "$JOB_SCRIPT"
+log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$JOB_LOG"; }
+for SRC_VMID in "${VMS_ARRAY[@]}"; do
+    log "Gerando Backup nativo da VM $SRC_VMID para o storage $LOCAL_STORAGE_NAME..."
+    vzdump $SRC_VMID --storage $LOCAL_STORAGE_NAME --mode snapshot --compress zstd >> "$JOB_LOG" 2>&1
 done
 EOF
     fi
@@ -567,11 +606,11 @@ main_menu() {
         echo "Arquivo de Log: $LOG_FILE"
         echo "Modo Atual: $( [[ $IS_CRON_MODE -eq 1 ]] && echo 'AGENDAMENTO (Gerar Cron)' || echo 'EXECUÇÃO IMEDIATA' )"
         echo "--------------------------------------------------------------------------------------------------"
-        echo "1) Exportação: SSH Backup & Restore (Seguro, gera arquivo local, transfere e restaura)"
-        echo "2) Exportação: SSH Pipe Direto (Streaming direto para o destino, sem uso de disco)"
+        echo "1) Exportação Remota: SSH Backup & Restore (Gera arquivo local, transfere via rede e restaura)"
+        echo "2) Exportação Remota: SSH Pipe Direto (Streaming direto para o destino, sem uso de disco extra)"
         echo "3) Replicação ZFS (ZFS Send/Receive - *Stub*)"
         echo "4) Migração Nativa (Cluster Proxmox - *Stub*)"
-        echo "5) Backups Locais/Remotos/USB (*Stub*)"
+        echo "5) Backup Nativo (Exporta VM para Storages Locais, PBS ou USB configurados no Proxmox)"
         echo "0) Sair"
         echo ""
         read -p "Selecione o método de execução: " OPTION
@@ -579,7 +618,8 @@ main_menu() {
         case $OPTION in
             1) ask_credentials; execute_backup_scp ;;
             2) ask_credentials; execute_direct_pipe ;;
-            3|4|5) echo "Em desenvolvimento. Retornando..."; sleep 1 ;;
+            3|4) echo "Em desenvolvimento. Retornando..."; sleep 1 ;;
+            5) execute_native_backup ;;
             0) rm -rf "$TEMP_DIR"; exit 0 ;;
             *) echo "Opção inválida."; sleep 1 ;;
         esac
